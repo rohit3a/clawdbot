@@ -9,7 +9,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const HOME = os.homedir();
 const DIR = process.env.CLAWD_HOME || path.join(HOME, '.clawd');
 const PUSH_GAP_MS = 20_000;
