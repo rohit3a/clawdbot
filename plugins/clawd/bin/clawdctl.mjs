@@ -258,14 +258,8 @@ const commands = {
       const events = names.map((n) => readJson(sub('outbox', n))).filter(Boolean);
       const byId = new Map(agents(true).map((a) => [a.sessionId, a]));
       for (const e of events) e.name = byId.get(e.sessionId)?.name ?? null;
-      const body = { machine: machine(), sentAt: new Date().toISOString(), events, text: events.map(line).join('\n') };
       writeJson(sub('push-state.json'), { lastPushAt: Date.now() });
-      const res = await fetch(hook.url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', ...(hook.key ? { authorization: `Bearer ${hook.key}` } : {}) },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15_000),
-      });
+      const res = await post(hook, events);
       if (!res.ok) return quiet ? undefined : { sent: 0, status: res.status };
       for (const n of names) fs.rmSync(sub('outbox', n), { force: true });
       return quiet ? undefined : { sent: events.length };
@@ -274,6 +268,16 @@ const commands = {
     }
   },
 };
+
+function post(hook, events) {
+  const auth = hook.auth ?? (hook.key ? `Bearer ${hook.key}` : undefined);
+  return fetch(hook.url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(auth ? { authorization: auth } : {}) },
+    body: JSON.stringify({ machine: machine(), sentAt: new Date().toISOString(), events, text: events.map(line).join('\n') }),
+    signal: AbortSignal.timeout(15_000),
+  });
+}
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -300,6 +304,7 @@ function line(e) {
   if (e.kind === 'turn_done') return `${who} finished a turn: ${(e.answer ?? '').slice(0, 300)}`;
   if (e.kind === 'takeover') return `${who}: Clawd Bot has this session now (${e.by === 'you' ? 'handed over at the machine' : 'taken over by the bot'}, mode ${e.mode}).`;
   if (e.kind === 'released') return `${who} is back with the person at the machine. Its asks show there again.`;
+  if (e.kind === 'test') return `[${machine()}] Clawd Bot is connected.`;
   if (e.kind === 'ended') return `${who} ended.`;
   if (e.kind === 'steer_failed') return `${who} could not run on ${[e.model, e.effort].filter(Boolean).join(' ')}; it went back to its own model and effort.`;
   if (e.kind === 'failed') return `${who} failed (${e.reason}): ${(e.answer ?? '').slice(0, 300)}`;
@@ -452,7 +457,7 @@ function link() {
   fs.mkdirSync(bin, { recursive: true });
   const shim = path.join(bin, 'clawdctl');
   fs.rmSync(shim, { force: true });
-  fs.writeFileSync(shim, '#!/bin/sh\nexec node "$(cat "${CLAWD_HOME:-$HOME/.clawd}/plugin-root")/bin/clawdctl.mjs" "$@"\n', { mode: 0o755 });
+  fs.writeFileSync(shim, `#!/bin/sh\nexec '${process.execPath}' "$(cat "\${CLAWD_HOME:-$HOME/.clawd}/plugin-root")/bin/clawdctl.mjs" "$@"\n`, { mode: 0o755 });
   const onPath = (process.env.PATH ?? '').split(path.delimiter).includes(bin);
   return { linked: shim, pluginRoot: root, note: onPath ? 'Run clawdctl from any shell.' : `Add ${bin} to your PATH.` };
 }
@@ -482,7 +487,7 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --answers '<json>'
   clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
   clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
-  clawdctl config webhook --url <url> [--key-stdin] | config webhook --off | config machine <name> | config show
+  clawdctl config webhook (asks for the two lines) | config webhook --test | config webhook --off | config machine <name> | config show
   clawdctl link           put clawdctl on your PATH (~/.local/bin), kept current by the mod
   clawdctl mcp            MCP over stdio (for a local agent, or ssh host clawdctl mcp)
   clawdctl serve [--host ip] [--port 7477]   MCP over HTTP on your tailnet, key in ~/.clawd/serve.key`;
@@ -533,15 +538,35 @@ async function configure(pos, flags) {
     writeJson(sub('config.json'), rest);
     return { webhook: null };
   }
-  if (pos[0] === 'webhook') {
-    if (!flags.url) refuse('Give --url, and pipe the key with --key-stdin if the webhook needs one.');
+  if (pos[0] === 'webhook' && flags.test) {
+    const hook = c.webhook ?? refuse('No webhook set yet.');
+    const res = await post(hook, [{ id: `test-${Date.now().toString(36)}`, at: Date.now(), kind: 'test' }]).catch(() => undefined);
+    if (!res?.ok) refuse(`The webhook ${res ? `answered ${res.status}` : 'could not be reached'}. Run clawdctl config webhook again and paste both lines.`);
+    return { test: 'OK' };
+  }
+  if (pos[0] === 'webhook' && flags.url) {
     let key;
     if (flags.keyStdin) { key = ''; for await (const chunk of process.stdin) key += chunk; key = key.trim(); }
-    writeJson(sub('config.json'), { ...c, webhook: { url: flags.url, ...(key ? { key } : {}) } });
+    writeJson(sub('config.json'), { ...c, webhook: { url: flags.url, ...(key ? { auth: `Bearer ${key}` } : {}) } });
     return { webhook: flags.url, key: key ? 'saved' : 'none' };
   }
+  if (pos[0] === 'webhook') {
+    // pasted by the person at the machine, so the key never passes through the bot or its chat
+    const rl = (await import('node:readline')).createInterface({ input: process.stdin });
+    const lines = rl[Symbol.asyncIterator]();
+    const ask = async (prompt) => { process.stdout.write(prompt); const r = await lines.next(); return (r.value ?? '').trim(); };
+    const url = await ask('Line 1: Webhook URL starting https://\n> ');
+    if (!/^https:\/\/\S+$/.test(url)) { rl.close(); refuse('That is not a webhook URL. Run clawdctl config webhook again.'); }
+    const header = await ask('Line 2: Authorization header starting Authorization:\n> ');
+    rl.close();
+    const auth = header.replace(/^authorization:\s*/i, '');
+    if (!auth) refuse('No Authorization line. Run clawdctl config webhook again.');
+    writeJson(sub('config.json'), { ...c, webhook: { url, auth } });
+    const res = await post({ url, auth }, [{ id: `test-${Date.now().toString(36)}`, at: Date.now(), kind: 'test' }]).catch(() => undefined);
+    return { saved: true, test: res?.ok ? 'OK' : `failed (${res?.status ?? 'no answer'}): paste both lines again` };
+  }
   if (pos[0] === 'machine') { writeJson(sub('config.json'), { ...c, machine: pos[1] }); return { machine: pos[1] }; }
-  return { machine: machine(), webhook: c.webhook?.url ?? null, key: c.webhook?.key ? 'set' : 'none' };
+  return { machine: machine(), webhook: c.webhook?.url ? 'set' : null, key: c.webhook?.auth || c.webhook?.key ? 'set' : 'none' };
 }
 
 main();
