@@ -1,0 +1,14 @@
+{
+  "name": "clawdbot",
+  "owner": { "name": "rohit3a", "url": "https://github.com/rohit3a" },
+  "plugins": [
+    {
+      "name": "clawd",
+      "source": "./plugins/clawd",
+      "description": "Let a bot such as Grok Bot take over a Claude Code session: questions, permissions, steering."
+    }
+  ],
+  "metadata": {
+    "description": "Clawd Bot: drive Claude Code on your own machines from any MCP agent, with no service in the middle."
+  }
+}
