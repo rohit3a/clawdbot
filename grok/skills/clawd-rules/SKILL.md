@@ -24,7 +24,7 @@ description: >-
 | Start one | `start --folder '<dir>' --prompt '<text>' --name '<n>' --model <m> --effort <e> [--mode babysit]` |
 | Take over, hand back | `take-over '<s>' [--mode handle\|babysit]`, `release '<s>'`, `mode '<s>' handle\|babysit` |
 | Answer | `answer <askId> --pick '<label>'`, `answer <askId> --answers '<json>'`, `answer <askId> --decision allow\|deny [--reason '<why>']` |
-| Steer | `send '<s>' '<text>'`, `interrupt '<s>'`, `model '<s>' <m>`, `effort '<s>' <low\|medium\|high\|xhigh\|max>` (`default` undoes either) |
+| Steer | `send '<s>' '<text>'`, `interrupt '<s>'`, `model '<s>' <m>`, `effort '<s>' <low\|medium\|high\|xhigh\|max>`, `permissions '<s>' acceptEdits\|dontAsk` (`default` undoes each) |
 | Watch | `peek '<s>' [--count n]`, `report '<s>' <minutes\|off>` |
 | End | `stop '<s>'` (background sessions only) |
 

@@ -78,6 +78,7 @@ function describe(a, asks) {
     reportEveryMin: control?.reportEveryMin,
     model: control?.model ?? live?.model,
     effort: control?.effort,
+    permissions: control?.permissions,
     asks: pending.map((k) => k.id),
     lastAnswer: live?.lastAnswer ? live.lastAnswer.slice(0, 600) : undefined,
   };
@@ -216,6 +217,11 @@ const commands = {
     if (!model) refuse('Give a model, e.g. sonnet, opus, haiku, or "default" for the session\'s own.');
     return setRuns(session, { model: model === 'default' ? undefined : model });
   },
+  set_permissions({ session, permissions }) {
+    const allowed = ['default', 'acceptEdits', 'dontAsk'];
+    if (!allowed.includes(permissions)) refuse(`Permission mode is one of ${allowed.join(', ')}. plan, auto and bypass are not offered: set them at the computer.`);
+    return setRuns(session, { permissions: permissions === 'default' ? undefined : permissions });
+  },
   set_effort({ session, effort }) {
     if (!EFFORTS.includes(effort) && effort !== 'default') refuse(`Effort is one of ${EFFORTS.join(', ')}, or "default".`);
     return setRuns(session, { effort: effort === 'default' ? undefined : effort });
@@ -286,7 +292,7 @@ function setRuns(ref, change) {
   const c = controlOf(a.sessionId) ?? refuse(`Session ${a.name ?? a.sessionId} is not taken over. Take it over first.`);
   const next = { ...c, ...change };
   writeJson(sub('control', `${a.sessionId}.json`), next);
-  return { session: a.sessionId, model: next.model ?? 'session default', effort: next.effort ?? 'session default', note: 'Applies from the next request, for as long as the bot has the session.' };
+  return { session: a.sessionId, model: next.model ?? 'session default', effort: next.effort ?? 'session default', permissions: next.permissions ?? 'session default', note: 'Applies from the next request, for as long as the bot has the session.' };
 }
 
 function steer(ref, item) {
@@ -372,6 +378,7 @@ const TOOLS = [
   ['interrupt', 'Stop what a taken-over session is doing right now (like pressing Esc).', { session: S }, ['session'], 'interrupt'],
   ['set_model', 'Change the model of a taken-over session from its next request on, while you have it. "default" goes back to its own.', { session: S, model: S }, ['session', 'model'], 'set_model'],
   ['set_effort', 'Change the reasoning effort (low, medium, high, xhigh, max) of a taken-over session from its next request on, while you have it. "default" goes back to its own.', { session: S, effort: S }, ['session', 'effort'], 'set_effort'],
+  ['set_permissions', 'Set how a taken-over session handles permission prompts while you have it: acceptEdits allows file edits inside its folder without asking, dontAsk denies anything not pre-approved, default goes back to asking you.', { session: S, permissions: { ...S, enum: ['default', 'acceptEdits', 'dontAsk'] } }, ['session', 'permissions'], 'set_permissions'],
   ['set_report', 'Push a short progress report for a taken-over session every N minutes, or "off".', { session: S, minutes: S }, ['session', 'minutes'], 'set_report'],
   ['peek', 'The last messages of a session and its state, to summarise it for the person.', { session: S, count: { type: 'number' } }, ['session'], 'peek'],
   ['stop_session', 'Stop a background session. Its conversation is kept and can be resumed.', { session: S }, ['session'], 'stop'],
@@ -486,6 +493,7 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl take-over <session> [--mode handle|babysit] | release <session> | mode <session> handle|babysit
   clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --answers '<json>'
   clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
+  clawdctl permissions <session> default|acceptEdits|dontAsk
   clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
   clawdctl config webhook (asks for the two lines) | config webhook --test | config webhook --off | config machine <name> | config show
   clawdctl link           put clawdctl on your PATH (~/.local/bin), kept current by the mod
@@ -510,6 +518,7 @@ async function main() {
       case 'interrupt': return commands.interrupt({ session: pos[0] });
       case 'model': return commands.set_model({ session: pos[0], model: pos[1] });
       case 'effort': return commands.set_effort({ session: pos[0], effort: pos[1] });
+      case 'permissions': return commands.set_permissions({ session: pos[0], permissions: pos[1] });
       case 'report': return commands.set_report({ session: pos[0], minutes: pos[1] });
       case 'peek': return commands.peek({ session: pos[0], count: flags.count });
       case 'stop': return commands.stop({ session: pos[0] });

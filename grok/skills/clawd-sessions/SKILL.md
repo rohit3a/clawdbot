@@ -30,6 +30,7 @@ Steering needs the session taken over; clawdctl refuses otherwise, so offer to t
 - Message: `send '<X>' '<text>'`. Pass the user's words. If you add context, keep it short and concrete. It arrives within seconds, as its next prompt or alongside the current turn.
 - Interrupt: `interrupt '<X>'`. The interrupted turn arrives as an event.
 - Model or effort: `model '<X>' <m>`, `effort '<X>' <level>`; `default` undoes it. They apply from the next request while you have the session; released, it goes back to its own.
+- Permission mode: `permissions '<X>' acceptEdits` lets it edit files inside its folder without asking; `dontAsk` denies anything not already allowed, without asking; `default` goes back to asking. It lasts while you have the session. Plan, auto and bypass modes are set at the computer, not from here.
 
 ## Watch
 - "What did it say / what is it doing": `peek '<X>' --count 6` and summarise its last messages in two or three lines.

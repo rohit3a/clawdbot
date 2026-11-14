@@ -4,7 +4,8 @@ type $ = EngineInterface
 
 type Mode = 'handle' | 'babysit'
 type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-type Control = { takenOver: boolean; mode: Mode; by: 'bot' | 'you'; since: number; reportEveryMin?: number; model?: string; effort?: Effort }
+type Permissions = 'acceptEdits' | 'dontAsk'
+type Control = { takenOver: boolean; mode: Mode; by: 'bot' | 'you'; since: number; reportEveryMin?: number; model?: string; effort?: Effort; permissions?: Permissions }
 type Steer = { type: 'message'; text: string } | { type: 'interrupt' }
 type PermissionAnswer = { decision: 'allow' | 'deny'; reason?: string }
 type QuestionAnswer = { answers: Record<string, string> }
@@ -98,8 +99,20 @@ async function removeFiles($: $, paths: string[]): Promise<void> {
 function showStatus($: $): void {
   if (!control) return $.ui.status(undefined)
   const mode = control.mode === 'babysit' ? 'babysit' : 'handle it'
-  const runs = [control.model, control.effort].filter(Boolean).join(' ')
+  const runs = [control.model, control.effort, control.permissions].filter(Boolean).join(' ')
   $.ui.status(`Clawd Bot has this session · ${holding ? `waiting on ${holding}` : mode}${runs ? ` · ${runs}` : ''}`)
+}
+
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+
+// the bot's permission mode for this session, applied where Claude would ask; the user's own default mode is left alone
+function byPermissions(c: Control, tool: string, input: unknown): { decision: 'allow' | 'deny'; reason: string } | undefined {
+  if (c.permissions === 'dontAsk') return { decision: 'deny', reason: 'Not pre-approved, and Clawd Bot set this session to not ask. Find another way or say what you need.' }
+  if (c.permissions !== 'acceptEdits' || !EDIT_TOOLS.has(tool)) return undefined
+  const i = (input ?? {}) as Record<string, unknown>
+  const file = typeof i.file_path === 'string' ? i.file_path : typeof i.notebook_path === 'string' ? i.notebook_path : ''
+  const inside = cwd !== '' && file.startsWith(`${cwd.replace(/\/+$/, '')}/`) && !file.includes('/../')
+  return inside ? { decision: 'allow', reason: 'Edits in this folder are accepted while Clawd Bot has the session.' } : undefined
 }
 
 function summarize(tool: string, input: unknown): string {
@@ -183,7 +196,7 @@ async function tick($: $): Promise<void> {
       await removeFiles($, [`${await dir($)}/live/${await myId($)}.json`])
       await emit($, 'released', {})
       return
-    } else if (control && (was?.mode !== control.mode || was?.model !== control.model || was?.effort !== control.effort)) showStatus($)
+    } else if (control && (was?.mode !== control.mode || was?.model !== control.model || was?.effort !== control.effort || was?.permissions !== control.permissions)) showStatus($)
     if (!control) {
       if (unsent) await flush($, false)
       return
@@ -245,7 +258,7 @@ export const register: Register = on => {
     const now = await readControl($)
     if (word === 'on' || word === 'babysit' || word === 'handle') {
       const mode: Mode = word === 'babysit' ? 'babysit' : word === 'handle' ? 'handle' : now?.mode ?? 'handle'
-      await setClaim($, { takenOver: true, mode, by: now?.by ?? 'you', since: now?.since ?? Date.now(), reportEveryMin: now?.reportEveryMin, model: now?.model, effort: now?.effort })
+      await setClaim($, { takenOver: true, mode, by: now?.by ?? 'you', since: now?.since ?? Date.now(), reportEveryMin: now?.reportEveryMin, model: now?.model, effort: now?.effort, permissions: now?.permissions })
       await tick($)
       return { text: `Clawd Bot has this session (${mode === 'babysit' ? 'babysit: every ask goes to you' : 'handle it: the bot decides, asks you when unsure'}). /clawd off takes it back.` }
     }
@@ -274,7 +287,7 @@ export const register: Register = on => {
 
   // the bot's model and effort apply per request, so no /model dialog opens in a session nobody is watching
   on('turn.step', async function* ($, e, next) {
-    const c = e.agentId === undefined ? control : undefined
+    const c = e.agentId === undefined ? await readControl($) : undefined
     let req = e
     if (c?.model && c.model !== e.model) req = { ...req, model: c.model }
     if (c?.effort && c.effort !== e.effort) req = { ...req, effort: c.effort as typeof e.effort }
@@ -317,6 +330,8 @@ export const register: Register = on => {
     if (r.decision !== 'ask' || e.tool === 'AskUserQuestion' || e.tool === 'AskPerson') return r
     control = await readControl($)
     if (!control) return r
+    const set = byPermissions(control, e.tool, e.input)
+    if (set) return set
     const held = await hold<PermissionAnswer>($, 'permission', { tool: e.tool, summary: summarize(e.tool, e.input), reason: r.reason ?? null, subagent: e.agentId ?? null }, `${e.tool} permission`)
     if (held.kind === 'released') return r
     const { decision, reason } = held.answer

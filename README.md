@@ -15,7 +15,7 @@ Everything runs on your machines and over links you already have. There is no se
 - Start a session in a folder, already taken over, with Remote Control on. It returns a claude.ai link you can open on your phone, the web or the Claude app, plus `claude attach` and `claude --resume` commands for picking it up at the machine later.
 - Take over a running session, or release it back to you.
 - Answer its questions and permission prompts.
-- Send it a message, interrupt it, and change its model or effort.
+- Send it a message, interrupt it, and change its model, effort or permission mode (accept edits, or don't ask).
 - Read its last messages, and stop a background session.
 - Push events to the bot: asks, finished turns, interruptions and failures, plus a progress report at an interval you choose.
 
@@ -96,6 +96,7 @@ clawdctl start --folder <dir> --prompt <text> [--name n] [--model m] [--effort e
 clawdctl take-over <session> [--mode handle|babysit] | release <session> | mode <session> handle|babysit
 clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --answers '<json>'
 clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
+clawdctl permissions <session> default|acceptEdits|dontAsk
 clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
 clawdctl config webhook --url <url> [--key-stdin] | config webhook --off | config machine <name> | config show
 clawdctl link | mcp | serve [--host ip] [--port 7477]
@@ -112,14 +113,20 @@ The mod and clawdctl share files in `~/.clawd`:
 - `inbox/<session>/` holds messages and interrupts for the session.
 - `outbox/` holds events waiting to be pushed.
 
-An idle session reads only its own control file, every two seconds. A taken-over session holds each ask at the point Claude would show it, waits for an answer file, and lets go the moment the session is released. Model and effort changes apply to each request while the bot has the session, so no confirmation dialog opens on a screen nobody is watching. Sessions that `clawdctl start` launches take a claim for their folder in their first turn, so even their first prompt is covered.
+An idle session reads only its own control file, every two seconds. A taken-over session holds each ask at the point Claude would show it, waits for an answer file, and lets go the moment the session is released. Model, effort and permission-mode changes apply while the bot has the session, at each request and each permission check, so no confirmation dialog opens on a screen nobody is watching and your own default mode is left alone. Sessions that `clawdctl start` launches take a claim for their folder in their first turn, so even their first prompt is covered.
 
 ## Limits
 
 - Tested on Linux and macOS. Windows is untested.
 - A held ask waits as long as it takes. Your bot decides when to give up and answer.
-- Model and effort set by the bot last while it has the session. Released, the session goes back to its own.
+- Model, effort and permission mode set by the bot last while it has the session. Released, the session goes back to its own. The bot can't set plan, auto or bypass mode.
 - Background sessions need a trusted folder.
+
+## Tests
+
+```bash
+claude plugin test plugins/clawd
+```
 
 ## License
 
