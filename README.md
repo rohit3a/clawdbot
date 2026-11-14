@@ -21,7 +21,7 @@ Everything runs on your machines and over links you already have. There is no se
 - With each finished turn, pass on what it made: links (PRs, previews), media files (images, GIFs, videos, PDFs) the bot can fetch and post, the turn's commits and changed files, the PR and its checks, and the session's cost.
 - Turn on Remote Control when it takes over a terminal session, and send the bot the link.
 - Watch a PR's checks after a turn. When CI fails, the bot hears about it and the session is woken to fix it.
-- Cap what a session may spend. The bot is warned at 80%, and at 100% the turn stops before its next request.
+- Show what each session has cost. A spending cap is off by default: turned on for a session, it warns the bot at 80% and stops the turn at 100%.
 - Start a session later: at a time, or after a delay, from the computer's own timer (launchd on macOS, systemd on Linux).
 - Let a session ask your bot for help, if you turn it on for that session (AskGrok). The bot does read-only work itself, and anything that posts, sends, pays or changes an account waits for your yes. 6 requests an hour by default.
 

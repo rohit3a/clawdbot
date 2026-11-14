@@ -68,7 +68,7 @@ Per event kind:
 - request: a session asks you to do a task. Read the clawd-event skill, "Requests from a session", and follow it.
 - remote: one line with the Remote Control link (remoteUrl), or that it could not be turned on.
 - ci: one line: passed or failed on the PR, which checks failed, and whether the session was woken to fix it.
-- budget: level warn: one line with cost and budget. level stopped: a choice card: Raise the budget (to what), Leave it stopped.
+- budget: only for a session the user set a budget on. level warn: one line with cost and budget. level stopped: a choice card: Raise the budget (to what), Remove it, Leave it stopped. Act only on the user's pick.
 - scheduled: one line: the task started (name, Remote Control link), or why it did not.
 - progress: one line: working or idle, waiting on what, and the gist of lastAnswer.
 - takeover: one line that you now have the session, and its mode. released: one line that it is back with the user at the computer.

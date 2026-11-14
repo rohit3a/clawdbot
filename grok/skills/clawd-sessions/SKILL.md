@@ -36,7 +36,7 @@ Steering needs the session taken over; clawdctl refuses otherwise, so offer to t
 A terminal session gets Remote Control when it is taken over, and the link arrives as a `remote` event. Sessions started here have it already. For another one: `remote '<X>'`. The link opens the session on the phone, the web or the Claude app.
 
 ## Budget
-`budget '<X>' <usd>` caps what a taken-over session may spend: a `budget` event at 80%, and at 100% the turn stops before its next request. Suggest one for long or unattended work. `sessions` shows `costUsd`; `budget '<X>' off` removes it.
+Off unless the user turns it on. Only when the user asks for a budget on a session: `budget '<X>' <usd>` caps what it may spend, with a `budget` event at 80%, and at 100% the turn stops before its next request. Never set, suggest or raise one on your own. `sessions` and finished turns show `costUsd` either way; `budget '<X>' off` removes the cap.
 
 ## AskGrok
 Only when the user asks for it: `grok '<X>' on` lets that session ask you for help (6 requests an hour by default, `--per-hour n` to change). The user can also type `/clawd grok on` in the session. `grok '<X>' off` stops it.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- The spending cap is off unless the person turns it on for a session. The Grok skills never set, suggest or raise one on their own. Cost per session is still shown.
+
 ## 0.5.0
 
 - Each finished turn carries what it made: links from the answer and the PR or preview links its commands printed, media files it wrote or named (images, GIFs, videos, PDFs), its commits and changed files, the PR and its checks, and the session's cost. `clawdctl file <path>` hands the bot a listed file, up to 5 MB, to post in the chat.

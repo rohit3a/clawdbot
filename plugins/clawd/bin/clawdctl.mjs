@@ -792,7 +792,7 @@ const TOOLS = [
   ['peek', 'The last messages of a session and its state, to summarise it for the person.', { session: S, count: { type: 'number' } }, ['session'], 'peek'],
   ['stop_session', 'Stop a background session. Its conversation is kept and can be resumed.', { session: S }, ['session'], 'stop'],
   ['remote_control', 'Turn on Remote Control for a taken-over terminal session; the link arrives as a remote event.', { session: S }, ['session'], 'remote'],
-  ['set_budget', 'Cap what a taken-over session may spend, in US dollars, or "off". Warns at 80%; at 100% the turn stops before the next request.', { session: S, usd: S }, ['session', 'usd'], 'set_budget'],
+  ['set_budget', 'Off by default. Only when the person asks: cap what a taken-over session may spend, in US dollars, or "off". Warns at 80%; at 100% the turn stops before the next request.', { session: S, usd: S }, ['session', 'usd'], 'set_budget'],
   ['set_ci_wake', 'Whether a failed CI run on the session\'s PR wakes the session to fix it (on by default).', { session: S, on: { ...S, enum: ['on', 'off'] } }, ['session', 'on'], 'set_ci_wake'],
   ['get_file', 'A file a session made, as listed in an event\'s media: its type and base64 contents, up to 5 MB.', { path: S }, ['path'], 'file'],
   ['set_ask_grok', 'Let a session ask you for help (its AskGrok tool), or stop it. The person must want it on.', { session: S, on: { ...S, enum: ['on', 'off'] }, perHour: { type: 'number' } }, ['session', 'on'], 'set_grok'],
