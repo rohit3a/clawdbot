@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.2
+
+- The bot's approval of a plan now closes the session's own plan dialog. Before, the session took the answer but stayed at its dialog, since a plan only closes on a PermissionRequest answer.
+- A `ci` event names the failing checks with any `gh` version. Older `gh` releases have no `pr checks --json`, so the names now come from the PR's check rollup.
+
 ## 0.6.1
 
 - CI wake also covers checks that had already failed when the turn ended. Each commit is reported once.

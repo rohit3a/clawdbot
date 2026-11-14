@@ -316,10 +316,13 @@ test('a plan for approval reaches the bot whole', async ($, on) => {
   await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
   const plan = `# Plan\n${'- step\n'.repeat(200)}`
 
-  await $.tool.check({ tool: 'ExitPlanMode', input: { plan } })
+  const checked = await $.tool.check({ tool: 'ExitPlanMode', input: { plan } })
+  const r = await $.classic.PermissionRequest({ tool_name: 'ExitPlanMode', tool_input: { plan } })
 
   const ask = (outbox(files) as unknown as { kind: string; summary?: string }[]).find(e => e.kind === 'ask')!
+  expect(checked.decision).toBe('ask')
   expect(ask.summary).toBe(plan)
+  expect(r.decision).toEqual({ behavior: 'allow' })
 })
 
 test('a session near the end of its context says so once', async ($, on) => {

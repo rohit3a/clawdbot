@@ -615,13 +615,16 @@ function prOf(cwd) {
     const raw = execFileSync('gh', ['pr', 'view', '--json', 'number,url,state,headRefOid,statusCheckRollup'], { cwd, encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'ignore'] });
     const pr = JSON.parse(raw);
     const checks = { pass: 0, fail: 0, pending: 0 };
+    const failing = [];
     for (const c of pr.statusCheckRollup ?? []) {
       const v = String(c.conclusion || c.state || c.status || '').toUpperCase();
       if (['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(v)) checks.pass++;
-      else if (['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(v)) checks.fail++;
-      else checks.pending++;
+      else if (['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(v)) {
+        checks.fail++;
+        failing.push({ name: c.name || c.context, link: c.detailsUrl || c.targetUrl });
+      } else checks.pending++;
     }
-    return { number: pr.number, url: pr.url, state: pr.state, sha: pr.headRefOid, ...((pr.statusCheckRollup ?? []).length && { checks }) };
+    return { number: pr.number, url: pr.url, state: pr.state, sha: pr.headRefOid, ...((pr.statusCheckRollup ?? []).length && { checks }), ...(failing.length && { failing }) };
   } catch {
     return undefined;
   }
@@ -644,12 +647,7 @@ async function ciWatch({ session, cwd, pr, sha }) {
       if (!now || String(now.number) !== String(pr) || (sha && now.sha && now.sha !== sha)) return;
       if (!now.checks || now.checks.pending) continue;
       const failed = now.checks.fail > 0;
-      let failing = [];
-      if (failed) {
-        try {
-          failing = JSON.parse(execFileSync('gh', ['pr', 'checks', String(pr), '--json', 'name,bucket,link'], { cwd, encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'ignore'] })).filter((c) => c.bucket === 'fail').map((c) => ({ name: c.name, link: c.link }));
-        } catch {}
-      }
+      const failing = now.failing ?? [];
       const c = controlOf(session);
       const wake = failed && !!c && c.ciWake !== false;
       if (wake) {

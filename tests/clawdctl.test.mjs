@@ -385,8 +385,8 @@ test('a PR whose checks already failed wakes the session once per commit', async
   fs.mkdirSync(bin, { recursive: true });
   fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh
 case "$2" in
-  view) echo '{"number":9,"url":"https://github.com/o/r/pull/9","state":"OPEN","headRefOid":"abc123","statusCheckRollup":[{"conclusion":"FAILURE"},{"conclusion":"SUCCESS"}]}' ;;
-  checks) echo '[{"name":"test (ubuntu)","bucket":"fail","link":"https://x/1"},{"name":"lint","bucket":"pass","link":"https://x/2"}]' ;;
+  view) echo '{"number":9,"url":"https://github.com/o/r/pull/9","state":"OPEN","headRefOid":"abc123","statusCheckRollup":[{"name":"test (ubuntu)","conclusion":"FAILURE","detailsUrl":"https://x/1"},{"name":"lint","conclusion":"SUCCESS"}]}' ;;
+  *) echo 'unknown flag: --json' >&2; exit 1 ;;
 esac
 `, { mode: 0o755 });
 
@@ -399,6 +399,7 @@ esac
   const ci = listOutbox().find((e) => e.kind === 'ci');
   assert.equal(ci.state, 'fail');
   assert.equal(ci.woke, true);
+  assert.deepEqual(ci.failing, [{ name: 'test (ubuntu)', link: 'https://x/1' }]);
 
   await clawdctl(['git-summary', '--cwd', repo, '--session', SESSION]);
   await new Promise((r) => setTimeout(r, 1500));

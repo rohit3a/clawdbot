@@ -501,7 +501,8 @@ export const register: Register = on => {
 
   on('tool.check', async ($, e, next) => {
     const r = await next(e)
-    if (r.decision !== 'ask' || e.tool === 'AskUserQuestion' || e.tool === 'AskPerson') return r
+    // a plan's own dialog stays up whatever tool.check says: the PermissionRequest hook below answers it
+    if (r.decision !== 'ask' || e.tool === 'AskUserQuestion' || e.tool === 'AskPerson' || e.tool === 'ExitPlanMode') return r
     control = await readControl($)
     if (!control) return r
     const set = byPermissions(control, e.tool, e.input)
@@ -538,6 +539,19 @@ export const register: Register = on => {
       decision = { question: e.ask.slice(0, 300), options }
     }
     return r
+  })
+
+  // approving a plan is the person's: only a PermissionRequest answer closes its dialog
+  on('classic.PermissionRequest', async ($, e, next) => {
+    if (e.tool_name !== 'ExitPlanMode') return next(e)
+    control = await readControl($)
+    if (!control) return next(e)
+    const held = await hold<PermissionAnswer>($, 'permission', { tool: 'ExitPlanMode', summary: summarize('ExitPlanMode', e.tool_input), reason: null, subagent: null }, 'plan approval')
+    if (held.kind === 'released') return next(e)
+    const { decision, reason } = held.answer
+    return decision === 'allow'
+      ? { decision: { behavior: 'allow' as const } }
+      : { decision: { behavior: 'deny' as const, message: reason ?? 'The plan was not approved through Clawd Bot.' } }
   })
 
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
