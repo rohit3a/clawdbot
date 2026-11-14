@@ -13,6 +13,8 @@ type Held<A> = { kind: 'answered'; answer: A } | { kind: 'released' }
 
 const TICK_MS = 2000
 const WAIT_STEP_S = 540
+// the Claude desktop app ends a turn that sends nothing for about 15 minutes; a line in the transcript keeps it going
+const KEEPALIVE_STEP_S = 480
 const FLUSH_EVERY_MS = 5000
 const FLUSH_BACKOFF_MAX_MS = 300_000
 const ANSWER_CHARS = 1500
@@ -138,8 +140,12 @@ async function hold<A>($: $, kind: 'permission' | 'question', body: object, labe
   showStatus($)
   await writeLive($)
   await emit($, 'ask', { askId: id, ask: kind, ...body })
+  const started = Date.now()
+  // with no terminal (the desktop app, an SDK host) no status line is drawn and the host watches for silence
+  const quietSurface = !(await $.session.surfaces().catch(() => [])).includes('terminal')
+  if (quietSurface) $.ui.log(`Clawd Bot has this session: waiting on its answer to ${label}.`)
   const script = [
-    `for i in $(seq ${WAIT_STEP_S}); do`,
+    `for i in $(seq ${quietSurface ? KEEPALIVE_STEP_S : WAIT_STEP_S}); do`,
     `  if [ -f ${sh(answerFile)} ]; then cat ${sh(answerFile)}; exit 0; fi`,
     `  if ! grep -qs '"takenOver": *true' ${sh(controlFile)}; then exit 4; fi`,
     '  sleep 1',
@@ -151,6 +157,7 @@ async function hold<A>($: $, kind: 'permission' | 'question', body: object, labe
       const r = await $.process.run(['sh', '-c', script], { timeoutMs: (WAIT_STEP_S + 30) * 1000 })
       if (r.exitCode === 0) return { kind: 'answered', answer: JSON.parse(r.stdout) as A }
       if (r.exitCode === 4) return { kind: 'released' }
+      if (quietSurface) $.ui.log(`Clawd Bot has this session: still waiting on its answer to ${label} (${Math.round((Date.now() - started) / 60_000)} min).`)
     }
   } finally {
     holding = undefined

@@ -9,7 +9,7 @@ const CONTROL = `${HOME}/.clawd/control/${SESSION}.json`
 type Wait = (script: string) => { exitCode: number; stdout?: string }
 
 // The engine beneath the mod: an in-memory disk, a session, and the shell calls the mod makes.
-function engine(on: On, files: Map<string, string>, wait: Wait) {
+function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string[] = ['terminal'], logs: string[] = []) {
   const run = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   on('session.id', () => ({ value: SESSION }))
   on('session.cwd', () => ({ value: CWD }))
@@ -17,6 +17,11 @@ function engine(on: On, files: Map<string, string>, wait: Wait) {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('clock.every', () => ({ value: undefined }))
   on('ui.status', () => ({ value: undefined }))
+  on('session.surfaces', () => ({ value: surfaces as never }))
+  on('ui.log', (_, e) => {
+    logs.push(e.text)
+    return { value: undefined }
+  })
   on('command.register', () => ({ value: { command: 'clawd' } }))
   on('fs.read', (_, e) => (files.has(e.path) ? { value: files.get(e.path)! } : { deny: `no file ${e.path}` }))
   on('fs.write', (_, e) => {
@@ -29,7 +34,7 @@ function engine(on: On, files: Map<string, string>, wait: Wait) {
   on('process.run', (_, e) => {
     const [cmd, ...args] = e.argv
     if (cmd === 'sh' && args[1]?.includes('printf %s "$HOME"')) return run(0, HOME)
-    if (cmd === 'sh' && args[1]?.includes('seq 540')) {
+    if (cmd === 'sh' && /seq \d+/.test(args[1] ?? '')) {
       const r = wait(args[1])
       return run(r.exitCode, r.stdout ?? '')
     }
@@ -77,6 +82,34 @@ test('a taken-over session waits for the bot and takes its answer', async ($, on
   expect(r.decision).toBe('allow')
   expect(outbox(files).map(e => e.kind)).toContain('ask')
   expect([...files.keys()].some(f => f.includes('/.clawd/asks/'))).toBe(false)
+})
+
+test('with no terminal the hold writes a line, and again each step, so the desktop app sees it alive', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  const logs: string[] = []
+  let steps = 0
+  engine(on, files, () => (++steps < 3 ? { exitCode: 3 } : { exitCode: 0, stdout: '{"decision":"allow"}' }), [], logs)
+  on('tool.check', () => ({ decision: 'ask' }))
+  await $.session.start({ cwd: CWD, surface: null, isInteractive: false })
+
+  const r = await $.tool.check({ tool: 'Bash', input: { command: 'npm test' } })
+
+  expect(r.decision).toBe('allow')
+  expect(logs.length).toBe(3)
+  expect(logs[0]).toContain('waiting on its answer to Bash permission')
+  expect(logs[1]).toContain('still waiting')
+})
+
+test('in a terminal the hold writes no lines; the status line says it', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  const logs: string[] = []
+  engine(on, files, () => ({ exitCode: 0, stdout: '{"decision":"allow"}' }), ['terminal'], logs)
+  on('tool.check', () => ({ decision: 'ask' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  await $.tool.check({ tool: 'Bash', input: { command: 'npm test' } })
+
+  expect(logs).toEqual([])
 })
 
 test('releasing a session mid-ask hands the ask back to the screen', async ($, on) => {

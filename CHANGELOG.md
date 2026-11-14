@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+- Sessions in the Claude desktop app, or any host with no terminal, survive a long wait for the bot. The app ends a turn that sends nothing for about 15 minutes, so while the bot holds an ask the session writes a line every 8 minutes. The first line, "Clawd Bot has this session: waiting on its answer to …", stands in for the status line the app doesn't draw.
+- clawdctl drops an ask whose session died or was killed while it waited, so the bot and the reminder routine no longer see it.
+
 ## 0.4.0
 
 - Events that arrive inside the 20-second gap between pushes are sent once the gap is over, even after their session has ended. Before, a session that failed or ended just after another push left its last events waiting until some other session started.

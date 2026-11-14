@@ -2,7 +2,7 @@
 // Run: node --test tests/
 
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -52,7 +52,7 @@ const read = (...p) => JSON.parse(fs.readFileSync(path.join(dir, ...p), 'utf8'))
 const control = (id = SESSION) => read('control', `${id}.json`);
 const writeAsk = (ask) => {
   fs.mkdirSync(path.join(dir, 'asks'), { recursive: true });
-  fs.writeFileSync(path.join(dir, 'asks', `${ask.id}.json`), JSON.stringify({ sessionId: SESSION, cwd: '/w/api', createdAt: 1, ...ask }));
+  fs.writeFileSync(path.join(dir, 'asks', `${ask.id}.json`), JSON.stringify({ sessionId: SESSION, cwd: '/w/api', createdAt: Date.now(), ...ask }));
 };
 const queue = (kind, extra = {}) => {
   fs.mkdirSync(path.join(dir, 'outbox'), { recursive: true });
@@ -177,11 +177,28 @@ test('a question takes a pick, or answers by question text, and refuses other qu
   assert.match((await clawdctl(['answer', 'gone', '--pick', 'x'])).stderr, /No open ask/);
 });
 
+// a stand-in for the mod's wait loop: a process whose command names the ask's answer file
+const waiter = (id) => spawn('sh', ['-c', `sleep 30; true ${path.join(dir, 'answers', `${id}.json`)}`], { stdio: 'ignore' });
+
 test('asks can be narrowed to the ones waiting longest', async () => {
+  const w = waiter('old');
   writeAsk({ id: 'old', kind: 'question', createdAt: Date.now() - 30 * 60_000 });
   writeAsk({ id: 'new', kind: 'question', createdAt: Date.now() });
   const r = await clawdctl(['asks', '--older-than', '15']);
+  w.kill();
   assert.deepEqual(r.json.asks.map((a) => [a.id, a.waitingMin]), [['old', 30]]);
+});
+
+test('an ask whose session died is dropped; a young one or one still waited on stays', async () => {
+  const w = waiter('held');
+  writeAsk({ id: 'held', kind: 'question', createdAt: Date.now() - 20 * 60_000 });
+  writeAsk({ id: 'orphan', kind: 'permission', createdAt: Date.now() - 20 * 60_000 });
+  writeAsk({ id: 'young', kind: 'question', createdAt: Date.now() - 5_000 });
+  const r = await clawdctl(['asks']);
+  w.kill();
+  assert.deepEqual(r.json.asks.map((a) => a.id).sort(), ['held', 'young']);
+  assert.equal(fs.existsSync(path.join(dir, 'asks', 'orphan.json')), false);
+  assert.match((await clawdctl(['answer', 'orphan', '--decision', 'allow'])).stderr, /No open ask/);
 });
 
 test('only background sessions can be stopped', async () => {

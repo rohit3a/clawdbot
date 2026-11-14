@@ -59,8 +59,26 @@ function controlOf(sessionId) {
   return c?.takenOver ? c : undefined;
 }
 
+// A held ask has a waiting process on this machine whose command names its answer file. A session that
+// died or was killed mid-ask (the desktop app does this to a turn it thinks has hung) leaves its ask behind.
+const ORPHAN_AFTER_MS = 60_000;
+function processList() {
+  try { return execFileSync('ps', ['-A', '-ww', '-o', 'command='], { encoding: 'utf8', timeout: 5_000, maxBuffer: 32 << 20 }); } catch { return undefined; }
+}
 function openAsks() {
-  return listJson(sub('asks')).map((n) => readJson(sub('asks', n))).filter(Boolean);
+  const asks = listJson(sub('asks')).map((n) => readJson(sub('asks', n))).filter(Boolean);
+  const unwatched = (ps) => (k) => Date.now() - (k.createdAt ?? 0) > ORPHAN_AFTER_MS && !ps.includes(`answers/${k.id}.json`);
+  let ps = processList();
+  if (ps === undefined) return asks;
+  let dead = asks.filter(unwatched(ps));
+  if (dead.length) {
+    // one wait step ends and the next starts in a moment; look again before calling an ask dead
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_500);
+    ps = processList() ?? '';
+    dead = dead.filter(unwatched(ps));
+  }
+  for (const k of dead) fs.rmSync(sub('asks', `${k.id}.json`), { force: true });
+  return asks.filter((k) => !dead.includes(k));
 }
 
 function describe(a, asks) {
