@@ -18,6 +18,12 @@ Everything runs on your machines and over links you already have. There is no se
 - Send it a message, interrupt it, and change its model, effort or permission mode (accept edits, or don't ask).
 - Read its last messages, and stop a background session.
 - Push events to the bot: asks, finished turns, interruptions and failures, plus a progress report at an interval you choose.
+- With each finished turn, pass on what it made: links (PRs, previews), media files (images, GIFs, videos, PDFs) the bot can fetch and post, the turn's commits and changed files, the PR and its checks, and the session's cost.
+- Turn on Remote Control when it takes over a terminal session, and send the bot the link.
+- Watch a PR's checks after a turn. When CI fails, the bot hears about it and the session is woken to fix it.
+- Cap what a session may spend. The bot is warned at 80%, and at 100% the turn stops before its next request.
+- Start a session later: at a time, or after a delay, from the computer's own timer (launchd on macOS, systemd on Linux).
+- Let a session ask your bot for help, if you turn it on for that session (AskGrok). The bot does read-only work itself, and anything that posts, sends, pays or changes an account waits for your yes. 6 requests an hour by default.
 
 ## Who decides
 
@@ -101,6 +107,7 @@ Installs and updates get the latest release, never unreleased work on `main`: th
 | `/clawd babysit` or `/clawd handle` | hand it over in that mode, or switch modes |
 | `/clawd off` | take it back |
 | `/clawd status` | show who has it |
+| `/clawd grok on` or `/clawd grok off` | let this session ask your bot for help with its AskGrok tool, or stop it |
 
 If you take a session back while it is waiting on an answer, the question or permission prompt reappears on the screen.
 
@@ -116,6 +123,10 @@ clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --an
 clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
 clawdctl permissions <session> default|acceptEdits|dontAsk
 clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
+clawdctl remote <session> | budget <session> <usd|off> | ci-wake <session> on|off | file <path>
+clawdctl grok <session> on|off [--per-hour n] | requests | reply <request> --text <t> | --decline <why>
+clawdctl schedule --at <21:30|+90m|ISO> --folder <dir> --prompt <text> [--name n] [--model m] [--effort e] [--mode m]
+clawdctl schedules | unschedule <id>
 clawdctl config webhook --url <url> [--key-stdin] | config webhook --off | config machine <name> | config show
 clawdctl link | mcp | serve [--host ip] [--port 7477]
 ```
@@ -139,6 +150,10 @@ An idle session reads only its own control file, every two seconds. A taken-over
 - A held ask waits as long as it takes. Your bot decides when to give up and answer.
 - Model, effort and permission mode set by the bot last while it has the session. Released, the session goes back to its own. The bot can't set plan, auto or bypass mode.
 - Background sessions need a trusted folder.
+- PR and CI status need the `gh` CLI signed in on the computer.
+- The cost and the budget need a host that keeps a cost ledger. The terminal always has one.
+- On Linux, scheduled tasks are systemd user timers, and a reboot clears them. On macOS they survive a reboot and run at wake if the Mac slept through them.
+- A session waits up to 20 minutes for an AskGrok answer. After that the answer arrives as a message.
 
 ## Tests and releases
 

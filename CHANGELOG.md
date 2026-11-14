@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0
+
+- Each finished turn carries what it made: links from the answer and the PR or preview links its commands printed, media files it wrote or named (images, GIFs, videos, PDFs), its commits and changed files, the PR and its checks, and the session's cost. `clawdctl file <path>` hands the bot a listed file, up to 5 MB, to post in the chat.
+- When the bot takes over a terminal session, the session turns on Remote Control and the link arrives as a `remote` event. `clawdctl remote <session>` asks for it again.
+- After a turn that leaves a PR's checks running, a watcher waits for them. A `ci` event says whether they passed. On a failure the session is woken with a message to fix it, unless `clawdctl ci-wake <session> off`.
+- `clawdctl budget <session> <usd>` caps what a taken-over session may spend: a `budget` event at 80%, and at 100% the turn ends before its next request.
+- AskGrok: a session the person opts in (`/clawd grok on`, or `clawdctl grok <session> on`) can ask the bot to do a task and gets the answer back as the tool result. At most 6 requests an hour by default. The Grok skills run read-only tasks and put anything that posts, sends, pays or changes an account to the person on a card. The bot answers with `clawdctl reply`.
+- `clawdctl schedule` starts a background session later, from launchd on macOS or a systemd user timer on Linux. `schedules` and `unschedule` list and cancel.
+- The events routine prompt is now v3, and the Grok skills cover each new event.
+
 ## 0.4.3
 
 - A finished turn's answer reaches the bot whole up to 8,000 characters, up from 1,500. A longer one ends in "…" and its event says `truncated: true` with the full length, so the bot reads the rest with `peek` instead of asking the session to resend.

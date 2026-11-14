@@ -2,7 +2,7 @@
 // Run: node --test tests/
 
 import assert from 'node:assert/strict';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -37,7 +37,7 @@ esac
 function clawdctl(args, { input } = {}) {
   return new Promise((resolve) => {
     const child = execFile(process.execPath, [CLAWDCTL, ...args], {
-      env: { ...process.env, HOME: home, CLAWD_HOME: dir, CLAUDE_BIN: path.join(root, 'claude'), CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+      env: { ...process.env, CLAWD_NO_TIMER: '1', HOME: home, CLAWD_HOME: dir, CLAUDE_BIN: path.join(root, 'claude'), CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
       timeout: 20_000,
     }, (err, stdout, stderr) => {
       let json;
@@ -283,6 +283,118 @@ test('peek returns long messages whole, and marks one over 8000 characters as cu
   assert.equal(cut.text.length, 8001);
   assert.equal(cut.truncated, true);
   assert.equal(cut.chars, 9000);
+});
+
+const transcript = (rows) => {
+  const project = path.join(home, '.claude', 'projects', '-w-api');
+  fs.mkdirSync(project, { recursive: true });
+  fs.writeFileSync(path.join(project, `${SESSION}.jsonl`), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+};
+
+test('a remote event carries the Remote Control link from the transcript', async () => {
+  await clawdctl(['config', 'webhook', '--url', hookUrl()]);
+  transcript([
+    { type: 'system', subtype: 'bridge_status', url: 'https://claude.ai/code/session_OLD' },
+    { type: 'system', subtype: 'bridge_status', url: 'https://claude.ai/code/session_NEW' },
+  ]);
+  assert.equal((await clawdctl(['remote-url', SESSION])).json.remoteUrl, 'https://claude.ai/code/session_NEW');
+  queue('remote');
+
+  await clawdctl(['flush']);
+  assert.equal(received[0].body.events[0].remoteUrl, 'https://claude.ai/code/session_NEW');
+  assert.match(received[0].body.text, /Remote Control: https:\/\/claude\.ai\/code\/session_NEW/);
+});
+
+test('media in an event keeps only files made in the turn, and only those can be fetched', async () => {
+  await clawdctl(['config', 'webhook', '--url', hookUrl()]);
+  const work = fs.mkdtempSync(path.join(root, 'work-'));
+  fs.writeFileSync(path.join(work, 'old.png'), 'old');
+  const past = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(path.join(work, 'old.png'), past, past);
+  fs.mkdirSync(path.join(work, 'out'));
+  fs.writeFileSync(path.join(work, 'out', 'shot.png'), 'png-bytes');
+  queue('turn_done', { cwd: work, answer: 'Made a screenshot.', media: ['out/shot.png', 'old.png', 'missing.gif'], mediaSince: Date.now() - 60_000, links: ['https://github.com/o/r/pull/7'] });
+
+  await clawdctl(['flush']);
+  const e = received[0].body.events[0];
+  assert.deepEqual(e.media, [{ path: path.join(work, 'out', 'shot.png'), type: 'image/png', bytes: 9 }]);
+  assert.match(received[0].body.text, /links: https:\/\/github\.com\/o\/r\/pull\/7; files: shot\.png/);
+  const got = await clawdctl(['file', path.join(work, 'out', 'shot.png')]);
+  assert.equal(Buffer.from(got.json.base64, 'base64').toString(), 'png-bytes');
+  const refused = await clawdctl(['file', path.join(work, 'old.png')]);
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /Only files a session made/);
+});
+
+test('AskGrok: opt-in per session, a reply reaches a waiting request, a late one arrives as a message', async () => {
+  const on = await clawdctl(['grok', 'api-fix', 'on', '--per-hour', '3']);
+  assert.deepEqual(read('grok', `${SESSION}.json`), { enabled: true, perHour: 3 });
+  assert.equal(on.json.askGrok, true);
+  fs.mkdirSync(path.join(dir, 'requests'), { recursive: true });
+  const req = (id, extra) => fs.writeFileSync(path.join(dir, 'requests', `${id}.json`), JSON.stringify({ id, sessionId: SESSION, task: 'Check Razorpay payments today', createdAt: Date.now(), pid: process.pid, ...extra }));
+  req('request-a', { waiting: true });
+  req('request-b', { waiting: false });
+
+  assert.equal((await clawdctl(['requests'])).json.requests.length, 2);
+  assert.equal((await clawdctl(['reply', 'request-a', '--text', '3 payments, 4,200 INR'])).json.delivered, 'as the tool result');
+  assert.deepEqual(read('answers', 'request-a.json'), { result: '3 payments, 4,200 INR' });
+  assert.equal((await clawdctl(['reply', 'request-b', '--decline', 'Posting needs Rohit'])).json.delivered, 'as a message');
+  const [msg] = fs.readdirSync(path.join(dir, 'inbox', SESSION));
+  assert.match(read('inbox', SESSION, msg).text, /declined your earlier AskGrok request .*Posting needs Rohit/);
+  assert.equal((await clawdctl(['reply', 'request-b', '--text', 'again'])).code, 1);
+});
+
+test('a budget needs the session taken over and a positive amount', async () => {
+  assert.equal((await clawdctl(['budget', 'api-fix', '5'])).code, 1);
+  await clawdctl(['take-over', 'api-fix']);
+  assert.equal((await clawdctl(['budget', 'api-fix', '0'])).code, 1);
+  assert.equal((await clawdctl(['budget', 'api-fix', '2.5'])).json.budgetUsd, 2.5);
+  assert.equal(control().budgetUsd, 2.5);
+  await clawdctl(['budget', 'api-fix', 'off']);
+  assert.equal(control().budgetUsd, undefined);
+});
+
+test('git-summary names the branch, the turn\'s commits and what changed', async () => {
+  const repo = fs.mkdtempSync(path.join(root, 'repo-'));
+  const git = (...a) => execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { encoding: 'utf8' }).trim();
+  git('init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'one\n');
+  git('add', '.');
+  git('commit', '-qm', 'first');
+  const since = git('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'one\ntwo\n');
+  git('commit', '-qam', 'second');
+  fs.writeFileSync(path.join(repo, 'b.txt'), 'new\n');
+  git('add', 'b.txt');
+
+  const r = (await clawdctl(['git-summary', '--cwd', repo, '--since', since])).json;
+  assert.equal(r.branch, 'main');
+  assert.equal(r.commits.length, 1);
+  assert.match(r.commits[0], /second$/);
+  assert.deepEqual(r.changed, { files: 2, insertions: 2, deletions: 0 });
+  assert.deepEqual((await clawdctl(['git-summary', '--cwd', root])).json, {});
+});
+
+test('a scheduled task is listed, can be cancelled, and refuses a time already past', async () => {
+  const r = await clawdctl(['schedule', '--at', '+90m', '--folder', '/w/api', '--prompt', 'Run the nightly checks', '--model', 'haiku', '--effort', 'low']);
+  const { tasks } = (await clawdctl(['schedules'])).json;
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].id, r.json.id);
+  assert.ok(Math.abs(new Date(tasks[0].at).getTime() - (Date.now() + 90 * 60_000)) < 120_000);
+  assert.equal((await clawdctl(['unschedule', r.json.id])).json.cancelled, true);
+  assert.equal((await clawdctl(['schedules'])).json.tasks.length, 0);
+  assert.equal((await clawdctl(['schedule', '--at', '2020-01-01T00:00', '--folder', '/w/api', '--prompt', 'x'])).code, 1);
+});
+
+test('a scheduled task that runs pushes a scheduled event', async () => {
+  await clawdctl(['config', 'webhook', '--url', hookUrl()]);
+  const work = fs.mkdtempSync(path.join(root, 'work-'));
+  const { json } = await clawdctl(['schedule', '--at', '+2h', '--folder', work, '--prompt', 'Run the nightly checks']);
+  await clawdctl(['run-scheduled', json.id]);
+  await until(() => received.length === 1, 30_000);
+  assert.equal(received[0].body.events[0].kind, 'scheduled');
+  assert.equal(received[0].body.events[0].taskId, json.id);
+  assert.equal((await clawdctl(['schedules'])).json.tasks.length, 0);
 });
 
 test('a refused push keeps the events for the next try', async () => {

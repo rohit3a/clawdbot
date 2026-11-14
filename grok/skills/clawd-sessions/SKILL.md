@@ -32,6 +32,18 @@ Steering needs the session taken over; clawdctl refuses otherwise, so offer to t
 - Model or effort: `model '<X>' <m>`, `effort '<X>' <level>`; `default` undoes it. They apply from the next request while you have the session; released, it goes back to its own.
 - Permission mode: `permissions '<X>' acceptEdits` lets it edit files inside its folder without asking; `dontAsk` denies anything not already allowed, without asking; `default` goes back to asking. It lasts while you have the session. Plan, auto and bypass modes are set at the computer, not from here.
 
+## Remote Control
+A terminal session gets Remote Control when it is taken over, and the link arrives as a `remote` event. Sessions started here have it already. For another one: `remote '<X>'`. The link opens the session on the phone, the web or the Claude app.
+
+## Budget
+`budget '<X>' <usd>` caps what a taken-over session may spend: a `budget` event at 80%, and at 100% the turn stops before its next request. Suggest one for long or unattended work. `sessions` shows `costUsd`; `budget '<X>' off` removes it.
+
+## AskGrok
+Only when the user asks for it: `grok '<X>' on` lets that session ask you for help (6 requests an hour by default, `--per-hour n` to change). The user can also type `/clawd grok on` in the session. `grok '<X>' off` stops it.
+
+## Later
+"Run this tonight", "at 9 tomorrow": `schedule --at '<time>' --folder '<dir>' --prompt '<task>' --name '<n>' --model <m> --effort <e>` (add `--mode babysit` if asked). At is `21:30` (the next one), `+90m`, `+2h`, or `2026-11-16T09:00`, in the computer's time zone. A background session starts then, taken over by you, and a `scheduled` event brings its name and Remote Control link. `schedules` lists them, `unschedule <id>` cancels. On Linux a reboot clears pending tasks.
+
 ## Watch
 - "What did it say / what is it doing": `peek '<X>' --count 6` and summarise its last messages in two or three lines. Each message holds up to 8,000 characters; one marked `truncated` is longer still. If its last reply puts a decision to the user, follow clawd-event, "Decisions in a reply".
 - Progress reports: `report '<X>' <minutes>` (or `off`). Each report arrives as an event.

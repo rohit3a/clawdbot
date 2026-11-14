@@ -17,6 +17,8 @@ function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('clock.every', () => ({ value: undefined }))
   on('ui.status', () => ({ value: undefined }))
+  on('ui.invalidate', () => ({ value: undefined }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('session.surfaces', () => ({ value: surfaces as never }))
   on('ui.log', (_, e) => {
     logs.push(e.text)
@@ -235,6 +237,60 @@ test('the question in the desktop app\'s closing box goes to the bot with the tu
   expect(done.find(e => e.answer === 'Next turn.')!.decision).toBe(undefined)
 })
 
+test('a turn passes on its links and the media it made', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, noWait)
+  on('turn.complete', () => ({ text: '' }))
+  on('tool.call', (_, e: any) => ({ result: e.tool === 'Bash' ? 'Created https://github.com/o/r/pull/12 and see https://example.com/docs' : 'ok' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  await $.turn.start({ turnId: 't1', text: 'go' } as never)
+  await $.tool.call({ tool: 'Write', file_path: `${CWD}/out/chart.png`, content: 'x' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' } as never)
+  await $.turn.complete({ turnId: 't1', answer: 'Done: see https://preview.example.app/x. The demo is in ./out/demo.gif.', durationMs: 5, isAborted: false, reason: 'answer' })
+
+  const done = (outbox(files) as unknown as { kind: string; links?: string[]; media?: string[] }[]).find(e => e.kind === 'turn_done')!
+  expect(done.links).toEqual(['https://preview.example.app/x', 'https://github.com/o/r/pull/12'])
+  expect(done.media).toEqual([`${CWD}/out/chart.png`, './out/demo.gif'])
+})
+
+test('AskGrok stops at the hourly cap', async ($, on) => {
+  const files = new Map([[`${HOME}/.clawd/grok/${SESSION}.json`, JSON.stringify({ enabled: true, perHour: 1 })]])
+  engine(on, files, () => ({ exitCode: 0, stdout: '{"result":"ok"}' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'clawd', args: 'status', origin: { kind: 'sdk' }, presentation: { isFullscreen: false, columns: 80 } })
+  await $.turn.start({ turnId: 't1', text: 'go' } as never)
+
+  const first = await $.tool.call({ tool: 'AskGrok', task: 'one' } as never)
+  const second = await $.tool.call({ tool: 'AskGrok', task: 'two' } as never)
+  expect(JSON.stringify(first)).toContain('ok')
+  expect(JSON.stringify(second)).toContain('1 requests an hour')
+})
+
+test('at its budget a taken-over session ends the turn before the next request', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver({ budgetUsd: 1 })]])
+  engine(on, files, noWait)
+  on('session.usage', () => ({ value: { startedAt: 0, context: {} as never, rateLimits: [], cost: { usd: 1.2 } } }))
+  let asked = 0
+  on('turn.step', async function* (_, e) {
+    asked++
+    return { turnId: e.turnId, index: e.index, answer: 'model ran', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  let res: unknown
+  const gen = $.turn.step({ turnId: 't1', index: 0, model: 'sonnet', effort: 'high' as const, messageCount: 1 })
+  for (;;) {
+    const n = await gen.next()
+    if (n.done) { res = n.value; break }
+  }
+
+  expect(asked).toBe(0)
+  expect(JSON.stringify(res)).toContain('budget')
+  const budget = (outbox(files) as unknown as { kind: string; level?: string }[]).find(e => e.kind === 'budget')!
+  expect(budget.level).toBe('stopped')
+})
+
 test('an idle session pushes nothing when a turn fails', async ($, on) => {
   const files = new Map<string, string>()
   engine(on, files, noWait)
@@ -264,4 +320,22 @@ test('headless runs without AskUserQuestion get the AskPerson tool', { plugins: 
   const r = await $.command.run({ command: 'list-tools', args: '', origin: { kind: 'sdk' }, presentation: { isFullscreen: false, columns: 80 } })
 
   expect(JSON.stringify(r)).toContain('AskPerson')
+})
+
+test('AskGrok is offered only when the person opts in, and returns the bot answer', { plugins: [lister] }, async ($, on) => {
+  const files = new Map<string, string>()
+  engine(on, files, () => ({ exitCode: 0, stdout: '{"result":"3 payments today"}' }))
+  on('tool.list', () => ({ value: [{ name: 'AskUserQuestion', description: 'ask', mcp: false }] }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  const names = async () => JSON.stringify(await $.command.run({ command: 'list-tools', args: '', origin: { kind: 'sdk' }, presentation: { isFullscreen: false, columns: 80 } }))
+
+  expect(await names()).not.toContain('AskGrok')
+  const off = await $.tool.call({ tool: 'AskGrok', task: 'Check Razorpay' } as never)
+  expect(JSON.stringify(off)).toContain('AskGrok is off')
+
+  await $.command.run({ command: 'clawd', args: 'grok on', origin: { kind: 'sdk' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(await names()).toContain('AskGrok')
+  const r = await $.tool.call({ tool: 'AskGrok', task: 'Check Razorpay payments today' } as never)
+  expect(JSON.stringify(r)).toContain('3 payments today')
+  expect(outbox(files).map(e => e.kind)).toContain('request')
 })
