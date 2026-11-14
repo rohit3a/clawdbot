@@ -27,7 +27,7 @@ Events (questions, permission prompts, finished and failed turns, progress repor
 2. Per computer, after the user's yes, open the paste window so the key never passes through chat:
    - macOS: `osascript -e 'tell application "Terminal" to activate' -e 'tell application "Terminal" to do script "~/.local/bin/clawdctl config webhook"'`
    - Linux: ask the user to run `~/.local/bin/clawdctl config webhook` in a terminal there.
-   It asks for "Line 1: Webhook URL" and "Line 2: Authorization header". Tell the user the same in one message. It saves both, sends a test, and prints `"test": "OK"`. The routine then gets a `test` event.
+   It asks for "Line 1: Webhook URL" and "Line 2: Authorization header" (the whole line, or just the key). Tell the user the same in one message. It saves both, sends a test, and prints `"test": "OK"`. The routine then gets a `test` event.
 3. Save to memory: events connected on <computer>.
 
 A wrong paste does no harm: run the window again. `~/.local/bin/clawdctl config webhook --test` re-sends a test; `--off` stops events from that computer.

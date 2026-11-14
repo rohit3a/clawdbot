@@ -557,9 +557,11 @@ async function configure(pos, flags) {
     const ask = async (prompt) => { process.stdout.write(prompt); const r = await lines.next(); return (r.value ?? '').trim(); };
     const url = await ask('Line 1: Webhook URL starting https://\n> ');
     if (!/^https:\/\/\S+$/.test(url)) { rl.close(); refuse('That is not a webhook URL. Run clawdctl config webhook again.'); }
-    const header = await ask('Line 2: Authorization header starting Authorization:\n> ');
+    const header = await ask('Line 2: Authorization header (the whole line, or just the key)\n> ');
     rl.close();
-    const auth = header.replace(/^authorization:\s*/i, '');
+    // the routine panel's line is "Authorization: Bearer <key>"; a bare key gets the Bearer scheme
+    const value = header.replace(/^authorization:\s*/i, '');
+    const auth = value && !/\s/.test(value) ? `Bearer ${value}` : value;
     if (!auth) refuse('No Authorization line. Run clawdctl config webhook again.');
     writeJson(sub('config.json'), { ...c, webhook: { url, auth } });
     const res = await post({ url, auth }, [{ id: `test-${Date.now().toString(36)}`, at: Date.now(), kind: 'test' }]).catch(() => undefined);
