@@ -8,12 +8,14 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const VERSION = '0.2.1';
 const HOME = os.homedir();
 const DIR = process.env.CLAWD_HOME || path.join(HOME, '.clawd');
 const PUSH_GAP_MS = 20_000;
 const MAX_OUTBOX = 200;
+const USER_PATH = process.env.PATH ?? '';
 process.env.PATH = [path.join(HOME, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH].join(path.delimiter);
 const CLAUDE = process.env.CLAUDE_BIN || 'claude';
 
@@ -105,7 +107,8 @@ const commands = {
   info() {
     let claude = 'unknown';
     try { claude = execFileSync(CLAUDE, ['--version'], { encoding: 'utf8', timeout: 10_000 }).trim(); } catch {}
-    return { machine: machine(), platform: process.platform, claude, clawdctl: VERSION, webhook: !!config().webhook?.url };
+    const plugin = installed();
+    return { machine: machine(), platform: process.platform, claude, clawdctl: VERSION, installed: plugin && { version: plugin.version, commit: plugin.gitCommitSha }, webhook: !!config().webhook?.url };
   },
 
   sessions({ all }) {
@@ -456,17 +459,43 @@ function serve({ host, port }) {
   server.listen(p, bind, () => process.stderr.write(`clawd MCP listening on http://${bind}:${p}/mcp\n`));
 }
 
-// run from the marketplace copy, which `claude plugin marketplace update` keeps current, not a versioned cache folder
+// what `claude plugin install` put on this machine, the copy each session's mod runs from
+function installed() {
+  const cfg = process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
+  const rows = readJson(path.join(cfg, 'plugins', 'installed_plugins.json'))?.plugins?.['clawd@clawdbot'];
+  return Array.isArray(rows) ? rows.find(r => r.scope === 'user') ?? rows[0] : undefined;
+}
+
+// The shim runs the installed copy of clawdctl, found afresh on every run, so it always matches the mod
+// after `claude plugin update`; plugin-root is the fallback for a copy run from its folder.
+const LAUNCHER = `import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const home = os.homedir();
+const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return undefined; } };
+let root;
+try {
+  const rows = JSON.parse(read(path.join(process.env.CLAUDE_CONFIG_DIR || path.join(home, '.claude'), 'plugins', 'installed_plugins.json')) ?? '{}').plugins?.['clawd@clawdbot'] ?? [];
+  root = (rows.find(r => r.scope === 'user') ?? rows[0])?.installPath;
+} catch {}
+const roots = [root, read(path.join(process.env.CLAWD_HOME || path.join(home, '.clawd'), 'plugin-root'))?.trim()];
+const found = roots.map(r => r && path.join(r, 'bin', 'clawdctl.mjs')).find(f => f && fs.existsSync(f));
+if (!found) { process.stderr.write('clawd is not installed: run claude plugin install clawd@clawdbot\\n'); process.exit(1); }
+await import(pathToFileURL(found).href);
+`;
+
 function link() {
-  const root = path.dirname(path.dirname(fs.realpathSync(process.argv[1])));
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
   fs.writeFileSync(sub('plugin-root'), root);
+  fs.writeFileSync(sub('launch.mjs'), LAUNCHER);
   const bin = path.join(HOME, '.local', 'bin');
   fs.mkdirSync(bin, { recursive: true });
   const shim = path.join(bin, 'clawdctl');
   fs.rmSync(shim, { force: true });
-  fs.writeFileSync(shim, `#!/bin/sh\nexec '${process.execPath}' "$(cat "\${CLAWD_HOME:-$HOME/.clawd}/plugin-root")/bin/clawdctl.mjs" "$@"\n`, { mode: 0o755 });
-  const onPath = (process.env.PATH ?? '').split(path.delimiter).includes(bin);
-  return { linked: shim, pluginRoot: root, note: onPath ? 'Run clawdctl from any shell.' : `Add ${bin} to your PATH.` };
+  fs.writeFileSync(shim, `#!/bin/sh\nexec '${process.execPath}' "\${CLAWD_HOME:-$HOME/.clawd}/launch.mjs" "$@"\n`, { mode: 0o755 });
+  const onPath = USER_PATH.split(path.delimiter).includes(bin);
+  return { linked: shim, runs: installed()?.installPath ?? root, note: onPath ? 'Run clawdctl from any shell.' : `Add ${bin} to your PATH.` };
 }
 
 // ---------- CLI ----------
@@ -496,7 +525,7 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl permissions <session> default|acceptEdits|dontAsk
   clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
   clawdctl config webhook (asks for the two lines) | config webhook --test | config webhook --off | config machine <name> | config show
-  clawdctl link           put clawdctl on your PATH (~/.local/bin), kept current by the mod
+  clawdctl link           put clawdctl on your PATH (~/.local/bin); it runs the installed version
   clawdctl mcp            MCP over stdio (for a local agent, or ssh host clawdctl mcp)
   clawdctl serve [--host ip] [--port 7477]   MCP over HTTP on your tailnet, key in ~/.clawd/serve.key`;
 

@@ -46,7 +46,7 @@ Then put `clawdctl` on your PATH:
 node ~/.claude/plugins/marketplaces/clawdbot/plugins/clawd/bin/clawdctl.mjs link
 ```
 
-`clawdctl info` should now print the machine name and your Claude Code version. To give the machine a friendlier name:
+`clawdctl info` should now print the machine name, your Claude Code version and the installed Clawd version and commit. To give the machine a friendlier name:
 
 ```bash
 clawdctl config machine Laptop
@@ -88,6 +88,10 @@ claude plugin update clawd@clawdbot
 ```
 
 `clawdctl` updates at once; sessions load the new mod when they next start.
+
+### Releases
+
+Installs and updates get the latest release, never unreleased work on `main`: the marketplace pins each release to its commit. Each [GitHub release](https://github.com/rohit3a/clawdbot/releases) lists that commit and carries the plugin as a tarball with a `SHA256SUMS` manifest. What changed is in [CHANGELOG.md](CHANGELOG.md).
 
 ## In the session
 
@@ -134,11 +138,19 @@ An idle session reads only its own control file, every two seconds. A taken-over
 - Model, effort and permission mode set by the bot last while it has the session. Released, the session goes back to its own. The bot can't set plan, auto or bypass mode.
 - Background sessions need a trusted folder.
 
-## Tests
+## Tests and releases
 
 ```bash
 claude plugin test plugins/clawd
 ```
+
+To cut a release, add a section for the version to `CHANGELOG.md`, commit it, then on `main`:
+
+```bash
+node scripts/release.mjs 0.3.0
+```
+
+It sets the version, validates and tests the plugin, tags the release, pins the marketplace to it, pushes, and publishes the GitHub release. `--dry-run` stops before committing.
 
 ## License
 

@@ -16,10 +16,10 @@ Run on that computer, one step at a time, and stop on the first error:
 1. `claude plugin marketplace add rohit3a/clawdbot`
 2. `claude plugin install clawd@clawdbot`
 3. `node ~/.claude/plugins/marketplaces/clawdbot/plugins/clawd/bin/clawdctl.mjs link`
-4. `~/.local/bin/clawdctl info` must print the machine name. Offer a friendlier name: `~/.local/bin/clawdctl config machine '<name>'`.
+4. `~/.local/bin/clawdctl info` must print the machine name and an `installed` version. Offer a friendlier name: `~/.local/bin/clawdctl config machine '<name>'`.
 5. Tell the user: every Claude Code session on that computer now has Clawd, idle until a session is handed to you. Sessions already open pick it up when they restart.
 
-Save to memory: Clawd installed on <computer>, the version from `info`.
+Save to memory: Clawd installed on <computer>, the `installed` version from `info`.
 
 ## Connect events
 Events (questions, permission prompts, finished and failed turns, progress reports) reach you through one webhook routine.
@@ -36,10 +36,10 @@ A wrong paste does no harm: run the window again. `~/.local/bin/clawdctl config 
 Each clawdctl command passes Auto-review unless a rule allows it. Suggest the user adds this Custom Rule in Grok Bot's settings, in their own words if they prefer: "Allow commands that run ~/.local/bin/clawdctl." Without it, each command waits for their approval card.
 
 ## Health
-Per computer: `~/.local/bin/clawdctl info` (versions, `webhook: true` when events are connected) and `~/.local/bin/clawdctl asks` (open asks). Report one line per computer.
+Per computer: `~/.local/bin/clawdctl info` (versions, the installed commit, `webhook: true` when events are connected) and `~/.local/bin/clawdctl asks` (open asks). Report one line per computer.
 
 ## Update
-On each computer: `claude plugin marketplace update clawdbot`, then `claude plugin update clawd@clawdbot`, then `~/.local/bin/clawdctl info`. clawdctl updates at once; sessions load the new mod when they next start. If `info` shows the old version, run step 3 of "Install on a computer" again.
+On each computer: `claude plugin marketplace update clawdbot`, then `claude plugin update clawd@clawdbot`, then `~/.local/bin/clawdctl info`. Updates bring the latest release, listed at github.com/rohit3a/clawdbot/releases. clawdctl updates at once; sessions load the new mod when they next start. If `info` shows no `installed` version, or an old one, run step 3 of "Install on a computer" again.
 
 ## Routine prompt
 Use the block below verbatim, from "Clawd events routine v1." to the end.
