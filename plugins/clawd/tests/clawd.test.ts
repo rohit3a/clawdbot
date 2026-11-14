@@ -33,7 +33,7 @@ function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string
   }))
   on('process.run', (_, e) => {
     const [cmd, ...args] = e.argv
-    if (cmd === 'sh' && args[1]?.includes('printf %s "$HOME"')) return run(0, HOME)
+    if (cmd === 'sh' && args[1]?.includes('"$HOME" "$PPID"')) return run(0, `${HOME}\n4242`)
     if (cmd === 'sh' && /seq \d+/.test(args[1] ?? '')) {
       const r = wait(args[1])
       return run(r.exitCode, r.stdout ?? '')

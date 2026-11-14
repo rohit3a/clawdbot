@@ -177,26 +177,21 @@ test('a question takes a pick, or answers by question text, and refuses other qu
   assert.match((await clawdctl(['answer', 'gone', '--pick', 'x'])).stderr, /No open ask/);
 });
 
-// a stand-in for the mod's wait loop: a process whose command names the ask's answer file
-const waiter = (id) => spawn('sh', ['-c', `sleep 30; true ${path.join(dir, 'answers', `${id}.json`)}`], { stdio: 'ignore' });
-
 test('asks can be narrowed to the ones waiting longest', async () => {
-  const w = waiter('old');
-  writeAsk({ id: 'old', kind: 'question', createdAt: Date.now() - 30 * 60_000 });
-  writeAsk({ id: 'new', kind: 'question', createdAt: Date.now() });
+  writeAsk({ id: 'old', kind: 'question', createdAt: Date.now() - 30 * 60_000, pid: process.pid });
+  writeAsk({ id: 'new', kind: 'question', createdAt: Date.now(), pid: process.pid });
   const r = await clawdctl(['asks', '--older-than', '15']);
-  w.kill();
   assert.deepEqual(r.json.asks.map((a) => [a.id, a.waitingMin]), [['old', 30]]);
 });
 
-test('an ask whose session died is dropped; a young one or one still waited on stays', async () => {
-  const w = waiter('held');
-  writeAsk({ id: 'held', kind: 'question', createdAt: Date.now() - 20 * 60_000 });
-  writeAsk({ id: 'orphan', kind: 'permission', createdAt: Date.now() - 20 * 60_000 });
-  writeAsk({ id: 'young', kind: 'question', createdAt: Date.now() - 5_000 });
+test('an ask whose session process has gone is dropped; a live one, or one with no pid, stays', async () => {
+  const gone = spawn('true');
+  await new Promise((r) => gone.on('exit', r));
+  writeAsk({ id: 'held', kind: 'question', pid: process.pid });
+  writeAsk({ id: 'orphan', kind: 'permission', pid: gone.pid });
+  writeAsk({ id: 'older-mod', kind: 'question' });
   const r = await clawdctl(['asks']);
-  w.kill();
-  assert.deepEqual(r.json.asks.map((a) => a.id).sort(), ['held', 'young']);
+  assert.deepEqual(r.json.asks.map((a) => a.id).sort(), ['held', 'older-mod']);
   assert.equal(fs.existsSync(path.join(dir, 'asks', 'orphan.json')), false);
   assert.match((await clawdctl(['answer', 'orphan', '--decision', 'allow'])).stderr, /No open ask/);
 });

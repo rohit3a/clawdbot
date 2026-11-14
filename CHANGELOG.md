@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2
+
+- An ask records its session's process id, and clawdctl drops an ask only when that process is gone. 0.4.1 judged by the waiting process instead, which has a moment between wait steps when none runs.
+
 ## 0.4.1
 
 - Sessions in the Claude desktop app, or any host with no terminal, survive a long wait for the bot. The app ends a turn that sends nothing for about 15 minutes, so while the bot holds an ask the session writes a line every 8 minutes. The first line, "Clawd Bot has this session: waiting on its answer to …", stands in for the status line the app doesn't draw.

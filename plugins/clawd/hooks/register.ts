@@ -40,8 +40,15 @@ let claimChecked = false
 
 const sh = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
 
+let pid: number | undefined
+
 async function dir($: $): Promise<string> {
-  if (!home) home = (await $.process.run(['sh', '-c', 'printf %s "$HOME"'])).stdout
+  if (!home) {
+    // the shell's parent is this session's process; its pid lets clawdctl tell a live ask from one left by a dead session
+    const [h = '', p = ''] = (await $.process.run(['sh', '-c', 'printf "%s\\n%s" "$HOME" "$PPID"'])).stdout.split('\n')
+    home = h
+    pid = Number(p) || undefined
+  }
   return `${home}/.clawd`
 }
 
@@ -135,7 +142,7 @@ async function hold<A>($: $, kind: 'permission' | 'question', body: object, labe
   const askFile = `${base}/asks/${id}.json`
   const answerFile = `${base}/answers/${id}.json`
   const controlFile = `${base}/control/${session}.json`
-  await $.fs.write(askFile, JSON.stringify({ id, kind, sessionId: session, cwd, mode: control?.mode, createdAt: Date.now(), ...body }))
+  await $.fs.write(askFile, JSON.stringify({ id, kind, sessionId: session, cwd, mode: control?.mode, createdAt: Date.now(), pid, ...body }))
   holding = label
   showStatus($)
   await writeLive($)
