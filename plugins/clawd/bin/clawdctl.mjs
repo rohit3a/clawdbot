@@ -180,9 +180,29 @@ const commands = {
     return { session: a.sessionId, reportEveryMin: every ?? 'off' };
   },
 
-  asks({ session }) {
-    const asks = openAsks().filter((k) => !session || k.sessionId === session || k.sessionId.startsWith(session));
+  asks({ session, olderThan }) {
+    const before = olderThan === undefined ? Infinity : Date.now() - Math.max(0, Number(olderThan)) * 60_000;
+    const asks = openAsks()
+      .filter((k) => !session || k.sessionId === session || k.sessionId.startsWith(session))
+      .filter((k) => (k.createdAt ?? 0) <= before)
+      .map((k) => ({ ...k, waitingMin: Math.floor((Date.now() - (k.createdAt ?? Date.now())) / 60_000) }));
     return { machine: machine(), asks };
+  },
+
+  // the newest release, read from the marketplace's GitHub repo with this computer's own git sign-in
+  check_update() {
+    const plugin = installed();
+    const repo = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude'), 'plugins', 'marketplaces', 'clawdbot');
+    let latest;
+    try {
+      execFileSync('git', ['-C', repo, 'fetch', '--quiet', 'origin'], { timeout: 30_000, stdio: 'ignore' });
+      const head = execFileSync('git', ['-C', repo, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { encoding: 'utf8', timeout: 10_000 }).trim();
+      const market = JSON.parse(execFileSync('git', ['-C', repo, 'show', `${head}:.claude-plugin/marketplace.json`], { encoding: 'utf8', timeout: 10_000 }));
+      latest = market.plugins?.find((p) => p.name === 'clawd')?.version;
+    } catch {}
+    if (!latest) refuse('Could not read the latest release. Is the clawdbot marketplace added, and can this computer reach GitHub?');
+    const newer = (a, b) => { const x = a.split('.').map(Number), y = (b ?? '0.0.0').split('.').map(Number); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]; return false; };
+    return { machine: machine(), installed: plugin?.version ?? null, latest, updateAvailable: newer(latest, plugin?.version), update: 'claude plugin marketplace update clawdbot && claude plugin update clawd@clawdbot' };
   },
 
   answer({ ask, decision, reason, pick, answers }) {
@@ -440,7 +460,8 @@ const TOOLS = [
   ['take_over', 'Take over a running session: from now its questions and permissions come to you instead of the screen, and you can steer it. Ask the person first unless they told you to.', { session: S, mode: { ...S, enum: ['handle', 'babysit'] } }, ['session'], 'take_over'],
   ['release', 'Give a session back to the person at the machine. Any question you were holding goes back to the local dialog.', { session: S }, ['session'], 'release'],
   ['set_mode', 'handle: you answer routine questions and permissions yourself and ask the person when unsure or risky (pushing, deleting, deploying, anything leaving the machine). babysit: every ask goes to the person.', { session: S, mode: { ...S, enum: ['handle', 'babysit'] } }, ['session', 'mode'], 'set_mode'],
-  ['list_asks', 'Open questions and permission requests from taken-over sessions on this machine.', { session: S }, [], 'asks'],
+  ['list_asks', 'Open questions and permission requests from taken-over sessions on this machine, each with how many minutes it has waited.', { session: S, olderThan: { type: 'number', description: 'Only asks waiting at least this many minutes.' } }, [], 'asks'],
+  ['check_update', 'Whether a newer Clawd release is out than the one installed on this machine, and the command that updates it.', {}, [], 'check_update'],
   ['answer', 'Answer an open ask. A permission takes decision allow or deny (and a reason the session will read). A question takes pick (the option label, for one question) or answers (an object from question text to answer).', { ask: S, decision: { ...S, enum: ['allow', 'deny'] }, reason: S, pick: S, answers: { type: 'object' } }, ['ask'], 'answer'],
   ['send_message', 'Send a message to a taken-over session, as if the person typed it. It runs when the session is next idle.', { session: S, text: S }, ['session', 'text'], 'send'],
   ['interrupt', 'Stop what a taken-over session is doing right now (like pressing Esc).', { session: S }, ['session'], 'interrupt'],
@@ -592,7 +613,7 @@ function parse(argv) {
 
 const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine for your bot.
 
-  clawdctl info | sessions [--all] | asks [--session <s>]
+  clawdctl info | check-update | sessions [--all] | asks [--session <s>] [--older-than <minutes>]
   clawdctl start --folder <dir> --prompt <text> [--name n] [--model m] [--effort e] [--mode handle|babysit]
   clawdctl take-over <session> [--mode handle|babysit] | release <session> | mode <session> handle|babysit
   clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --answers '<json>'
@@ -613,6 +634,7 @@ async function main() {
       case 'info': return commands.info();
       case 'sessions': return commands.sessions(flags);
       case 'asks': return commands.asks(flags);
+      case 'check-update': return commands.check_update();
       case 'start': return commands.start({ ...flags, prompt: flags.prompt ?? pos.join(' ') });
       case 'take-over': return commands.take_over({ session: pos[0], mode: flags.mode });
       case 'release': return commands.release({ session: pos[0] });

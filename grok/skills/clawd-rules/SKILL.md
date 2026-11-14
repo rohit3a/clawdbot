@@ -20,7 +20,7 @@ description: >-
 
 | Need | Command |
 | --- | --- |
-| What runs here | `info`, `sessions [--all]`, `asks` |
+| What runs here | `info`, `check-update`, `sessions [--all]`, `asks [--older-than <minutes>]` |
 | Start one | `start --folder '<dir>' --prompt '<text>' --name '<n>' --model <m> --effort <e> [--mode babysit]` |
 | Take over, hand back | `take-over '<s>' [--mode handle\|babysit]`, `release '<s>'`, `mode '<s>' handle\|babysit` |
 | Answer | `answer <askId> --pick '<label>'`, `answer <askId> --answers '<json>'`, `answer <askId> --decision allow\|deny [--reason '<why>']` |

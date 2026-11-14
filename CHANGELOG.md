@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- Events that arrive inside the 20-second gap between pushes are sent once the gap is over, even after their session has ended. Before, a session that failed or ended just after another push left its last events waiting until some other session started.
+- A failed turn's event carries the API error from the session's transcript, so the bot can say why it failed.
+- `clawdctl asks --older-than <minutes>` lists asks that have waited that long, each with `waitingMin`.
+- `clawdctl check-update` says whether a newer release is out than the one installed.
+- Two optional Grok Bot routines in clawd-setup: an hourly reminder of unanswered asks, and a daily update check.
+- The `clawdctl` shim finds Node again after Node is upgraded or switched.
+- clawdctl has its own tests, and CI runs every test on Linux and macOS on each push.
+
 ## 0.3.0
 
 - Installs and updates now get tagged releases. The marketplace pins each release to its commit, so work on `main` reaches no machine until it is released.

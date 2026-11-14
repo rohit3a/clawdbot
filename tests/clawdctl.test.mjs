@@ -177,6 +177,13 @@ test('a question takes a pick, or answers by question text, and refuses other qu
   assert.match((await clawdctl(['answer', 'gone', '--pick', 'x'])).stderr, /No open ask/);
 });
 
+test('asks can be narrowed to the ones waiting longest', async () => {
+  writeAsk({ id: 'old', kind: 'question', createdAt: Date.now() - 30 * 60_000 });
+  writeAsk({ id: 'new', kind: 'question', createdAt: Date.now() });
+  const r = await clawdctl(['asks', '--older-than', '15']);
+  assert.deepEqual(r.json.asks.map((a) => [a.id, a.waitingMin]), [['old', 30]]);
+});
+
 test('only background sessions can be stopped', async () => {
   assert.match((await clawdctl(['stop', 'api-docs'])).stderr, /Only background sessions/);
   const r = await clawdctl(['stop', 'api-fix']);

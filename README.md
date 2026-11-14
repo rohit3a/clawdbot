@@ -107,7 +107,7 @@ If you take a session back while it is waiting on an answer, the question or per
 ## clawdctl
 
 ```text
-clawdctl info | sessions [--all] | asks [--session <s>]
+clawdctl info | check-update | sessions [--all] | asks [--session <s>] [--older-than <minutes>]
 clawdctl start --folder <dir> --prompt <text> [--name n] [--model m] [--effort e] [--mode handle|babysit]
 clawdctl take-over <session> [--mode handle|babysit] | release <session> | mode <session> handle|babysit
 clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --answers '<json>'
