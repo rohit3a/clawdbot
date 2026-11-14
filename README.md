@@ -104,6 +104,8 @@ Installs and updates get the latest release, never unreleased work on `main`: th
 
 If you take a session back while it is waiting on an answer, the question or permission prompt reappears on the screen.
 
+The Claude desktop app draws no status line for plugins. There, a session your bot holds writes a dim line instead, "Clawd Bot has this session: waiting on its answer to …", and repeats it every 8 minutes while it waits. The app ends a turn that sends nothing for about 15 minutes, and the repeated line keeps it going.
+
 ## clawdctl
 
 ```text
