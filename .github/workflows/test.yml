@@ -1,0 +1,27 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: clawdctl
+        run: node --test tests/*.test.mjs
+      - name: Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.325
+      - name: Validate the marketplace and the plugin
+        run: |
+          claude plugin validate .
+          claude plugin validate plugins/clawd
+      - name: The mod
+        run: claude plugin test plugins/clawd

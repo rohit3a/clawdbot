@@ -51,6 +51,7 @@ step('validate and test');
 run('claude', ['plugin', 'validate', PLUGIN], { stdio: 'inherit' });
 run('claude', ['plugin', 'validate', '.'], { stdio: 'inherit' });
 run('claude', ['plugin', 'test', PLUGIN], { stdio: 'inherit' });
+run(process.execPath, ['--test', ...fs.readdirSync(path.join(ROOT, 'tests')).filter(f => f.endsWith('.test.mjs')).map(f => `tests/${f}`)], { stdio: 'inherit' });
 
 if (dry) {
   git('checkout', '--', PLUGIN);

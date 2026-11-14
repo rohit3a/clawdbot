@@ -2,7 +2,7 @@
 // clawdctl: drive Claude Code sessions on this machine for a bot (Clawd Bot), as a CLI or an MCP server.
 // No dependencies, Node 18+. State lives in ~/.clawd, shared with the clawd mod inside each session.
 
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -263,13 +263,24 @@ const commands = {
       for (const n of names.splice(0, Math.max(0, names.length - MAX_OUTBOX))) fs.rmSync(sub('outbox', n), { force: true });
       const hook = config().webhook;
       if (!hook?.url) return quiet ? undefined : { sent: 0, note: 'No webhook set. Run clawdctl config webhook.' };
-      if (Date.now() - (state.lastPushAt ?? 0) < PUSH_GAP_MS) return quiet ? undefined : { sent: 0, note: 'Waiting out the gap between pushes.' };
+      const wait = PUSH_GAP_MS - (Date.now() - (state.lastPushAt ?? 0));
+      if (wait > 0) {
+        pushLater(wait);
+        return quiet ? undefined : { sent: 0, note: `Pushing in ${Math.ceil(wait / 1000)} seconds.` };
+      }
       const events = names.map((n) => readJson(sub('outbox', n))).filter(Boolean);
       const byId = new Map(agents(true).map((a) => [a.sessionId, a]));
-      for (const e of events) e.name = byId.get(e.sessionId)?.name ?? null;
+      for (const e of events) {
+        e.name = byId.get(e.sessionId)?.name ?? null;
+        // the engine tells the mod a turn failed but not why; the session's transcript has the error
+        if (e.kind === 'failed' && !e.answer) e.answer = lastApiError(e.sessionId) ?? '';
+      }
       writeJson(sub('push-state.json'), { lastPushAt: Date.now() });
       const res = await post(hook, events);
-      if (!res.ok) return quiet ? undefined : { sent: 0, status: res.status };
+      if (!res.ok) {
+        pushLater(PUSH_GAP_MS);
+        return quiet ? undefined : { sent: 0, status: res.status };
+      }
       for (const n of names) fs.rmSync(sub('outbox', n), { force: true });
       return quiet ? undefined : { sent: events.length };
     } finally {
@@ -277,6 +288,40 @@ const commands = {
     }
   },
 };
+
+// Events that arrive inside the gap, or that a failing webhook refused, go out from one detached
+// process, so they don't wait for the session that queued them, which may have ended.
+const LATER_TRIES = 8;
+function pushLater(ms) {
+  const mark = sub('push.later');
+  try {
+    fs.mkdirSync(mark);
+  } catch {
+    const age = Date.now() - (fs.statSync(mark, { throwIfNoEntry: false })?.mtimeMs ?? 0);
+    if (age < 60 * 60_000) return;
+    fs.rmSync(mark, { recursive: true, force: true });
+    fs.mkdirSync(mark);
+  }
+  spawn(process.execPath, [fileURLToPath(import.meta.url), 'push-later', String(Math.ceil(ms))], { detached: true, stdio: 'ignore' }).unref();
+}
+
+async function pushLaterLoop(ms) {
+  let wait = Math.max(1_000, Number(ms) || PUSH_GAP_MS);
+  try {
+    for (let i = 0; i < LATER_TRIES; i++) {
+      await new Promise((r) => setTimeout(r, wait));
+      fs.utimesSync(sub('push.later'), new Date(), new Date());
+      const state = readJson(sub('push-state.json')) ?? {};
+      const gapLeft = PUSH_GAP_MS - (Date.now() - (state.lastPushAt ?? 0));
+      if (gapLeft > 0) { wait = gapLeft + 500; continue; }
+      await commands.flush({ quiet: true, later: true });
+      if (!listJson(sub('outbox')).length || !config().webhook?.url) return;
+      wait = Math.min(PUSH_GAP_MS * 2 ** (i + 1), 10 * 60_000);
+    }
+  } finally {
+    fs.rmSync(sub('push.later'), { recursive: true, force: true });
+  }
+}
 
 function post(hook, events) {
   const auth = hook.auth ?? (hook.key ? `Bearer ${hook.key}` : undefined);
@@ -341,6 +386,26 @@ function transcriptOf(sessionId) {
       if (fs.existsSync(f)) return f;
     }
   } catch {}
+  return undefined;
+}
+
+function lastApiError(sessionId) {
+  const file = transcriptOf(sessionId);
+  if (!file) return undefined;
+  const size = fs.statSync(file).size;
+  const len = Math.min(size, 200_000);
+  const buf = Buffer.alloc(len);
+  const fd = fs.openSync(file, 'r');
+  fs.readSync(fd, buf, 0, len, size - len);
+  fs.closeSync(fd);
+  for (const raw of buf.toString('utf8').split('\n').reverse()) {
+    let row;
+    try { row = JSON.parse(raw); } catch { continue; }
+    if (row.type !== 'assistant' || row.isSidechain) continue;
+    if (!row.isApiErrorMessage) return undefined;
+    const c = row.message?.content;
+    return (Array.isArray(c) ? c.filter((b) => b.type === 'text').map((b) => b.text).join(' ') : String(c ?? '')).slice(0, 400);
+  }
   return undefined;
 }
 
@@ -485,6 +550,16 @@ if (!found) { process.stderr.write('clawd is not installed: run claude plugin in
 await import(pathToFileURL(found).href);
 `;
 
+// The node that ran link first, then the usual places, so upgrading or switching Node doesn't break clawdctl.
+const shimScript = (node) => `#!/bin/sh
+for n in '${node.replace(/'/g, `'\\''`)}' "$(command -v node 2>/dev/null)" /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node \\
+  "$HOME/.local/share/fnm/aliases/default/bin/node" "$HOME/.volta/bin/node" "$HOME"/.nvm/versions/node/*/bin/node; do
+  [ -x "$n" ] && exec "$n" "\${CLAWD_HOME:-$HOME/.clawd}/launch.mjs" "$@"
+done
+echo 'clawdctl: no Node found. Install Node 18 or later.' >&2
+exit 1
+`;
+
 function link() {
   const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
   fs.writeFileSync(sub('plugin-root'), root);
@@ -493,7 +568,7 @@ function link() {
   fs.mkdirSync(bin, { recursive: true });
   const shim = path.join(bin, 'clawdctl');
   fs.rmSync(shim, { force: true });
-  fs.writeFileSync(shim, `#!/bin/sh\nexec '${process.execPath}' "\${CLAWD_HOME:-$HOME/.clawd}/launch.mjs" "$@"\n`, { mode: 0o755 });
+  fs.writeFileSync(shim, shimScript(process.execPath), { mode: 0o755 });
   const onPath = USER_PATH.split(path.delimiter).includes(bin);
   return { linked: shim, runs: installed()?.installPath ?? root, note: onPath ? 'Run clawdctl from any shell.' : `Add ${bin} to your PATH.` };
 }
@@ -552,6 +627,7 @@ async function main() {
       case 'peek': return commands.peek({ session: pos[0], count: flags.count });
       case 'stop': return commands.stop({ session: pos[0] });
       case 'flush': return commands.flush(flags);
+      case 'push-later': return pushLaterLoop(pos[0]);
       case 'config': return configure(pos, flags);
       case 'mcp': mcpStdio(); return undefined;
       case 'serve': serve(flags); return undefined;

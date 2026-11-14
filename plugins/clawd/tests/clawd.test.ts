@@ -157,6 +157,29 @@ test('the bot model and effort reach each request, and only while it has the ses
   ])
 })
 
+test('a turn that errors is pushed as failed, one that answers as done', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, noWait)
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  await $.turn.complete({ turnId: 't1', answer: 'API error: overloaded', durationMs: 5, isAborted: false, reason: 'error' })
+  await $.turn.complete({ turnId: 't2', answer: 'All done', durationMs: 5, isAborted: false, reason: 'answer' })
+
+  expect(outbox(files).map(e => e.kind)).toEqual(expect.arrayContaining(['failed', 'turn_done']))
+})
+
+test('an idle session pushes nothing when a turn fails', async ($, on) => {
+  const files = new Map<string, string>()
+  engine(on, files, noWait)
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  await $.turn.complete({ turnId: 't1', answer: 'API error', durationMs: 5, isAborted: false, reason: 'error' })
+
+  expect(outbox(files)).toEqual([])
+})
+
 // tool.list is raised by the engine, not by a test, so a second plugin asks for the list the session would get
 const lister = {
   name: 'lister',

@@ -144,6 +144,12 @@ An idle session reads only its own control file, every two seconds. A taken-over
 claude plugin test plugins/clawd
 ```
 
+```bash
+node --test tests/*.test.mjs
+```
+
+The first runs the mod's tests against Claude Code itself; the second runs clawdctl as a bot would, against a stand-in `claude` and a local webhook.
+
 To cut a release, add a section for the version to `CHANGELOG.md`, commit it, then on `main`:
 
 ```bash
