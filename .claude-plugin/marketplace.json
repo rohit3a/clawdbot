@@ -1,11 +1,21 @@
 {
   "name": "clawdbot",
-  "owner": { "name": "rohit3a", "url": "https://github.com/rohit3a" },
+  "owner": {
+    "name": "rohit3a",
+    "url": "https://github.com/rohit3a"
+  },
   "plugins": [
     {
       "name": "clawd",
-      "source": "./plugins/clawd",
-      "description": "Let a bot such as Grok Bot take over a Claude Code session: questions, permissions, steering."
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/rohit3a/clawdbot.git",
+        "path": "plugins/clawd",
+        "ref": "v0.3.0",
+        "sha": "efde1af93c53b69624b5668ce23e12f057edf218"
+      },
+      "description": "Let a bot such as Grok Bot take over a Claude Code session: questions, permissions, steering.",
+      "version": "0.3.0"
     }
   ],
   "metadata": {
