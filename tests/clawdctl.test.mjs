@@ -259,6 +259,32 @@ test('a failed turn is pushed with the error from its transcript', async () => {
   assert.match(received[0].body.text, /failed \(error\): There is an issue with the selected model/);
 });
 
+test('a cut answer and a decision for the person are named in the readable line', async () => {
+  await clawdctl(['config', 'webhook', '--url', hookUrl()]);
+  queue('turn_done', { answer: `${'a'.repeat(8000)}…`, truncated: true, answerChars: 12000, decision: { question: 'Ship 0.4.3?', options: ['Yes, ship it', 'Not now'] } });
+
+  await clawdctl(['flush']);
+  assert.match(received[0].body.text, /\[answer cut: 12000 chars, peek for the rest\]/);
+  assert.match(received[0].body.text, /Decision for the person: Ship 0\.4\.3\? \[Yes, ship it \/ Not now\]/);
+  assert.equal(received[0].body.events[0].answer.length, 8001);
+});
+
+test('peek returns long messages whole, and marks one over 8000 characters as cut', async () => {
+  const project = path.join(home, '.claude', 'projects', '-w-api');
+  fs.mkdirSync(project, { recursive: true });
+  fs.writeFileSync(path.join(project, `${SESSION}.jsonl`), [
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'b'.repeat(5000) }] } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'c'.repeat(9000) }] } },
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+
+  const [whole, cut] = (await clawdctl(['peek', 'api-fix', '--count', '2'])).json.messages;
+  assert.equal(whole.text.length, 5000);
+  assert.equal(whole.truncated, undefined);
+  assert.equal(cut.text.length, 8001);
+  assert.equal(cut.truncated, true);
+  assert.equal(cut.chars, 9000);
+});
+
 test('a refused push keeps the events for the next try', async () => {
   await clawdctl(['config', 'webhook', '--url', hookUrl()]);
   hook.status = 401;

@@ -17,7 +17,8 @@ const WAIT_STEP_S = 540
 const KEEPALIVE_STEP_S = 480
 const FLUSH_EVERY_MS = 5000
 const FLUSH_BACKOFF_MAX_MS = 300_000
-const ANSWER_CHARS = 1500
+const ANSWER_CHARS = 8000
+const GIST_CHARS = 1500
 
 let home: string | undefined
 let sessionId: string | undefined
@@ -37,6 +38,8 @@ let ticking = false
 // events still in the outbox; a released session keeps flushing until they are gone, then is idle
 let unsent = false
 let claimChecked = false
+// the Claude desktop app shows a turn's closing question in its own box, outside the answer
+let decision: { question: string; options: string[] } | undefined
 
 const sh = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
 
@@ -93,11 +96,16 @@ async function flush($: $, soon: boolean): Promise<void> {
   flushGap = unsent ? Math.min(flushGap * 2, FLUSH_BACKOFF_MAX_MS) : FLUSH_EVERY_MS
 }
 
+// a cut answer says so, so the bot reads the rest with peek instead of guessing
+function clip(text: string, max: number): { text: string; truncated?: true; chars?: number } {
+  return text.length > max ? { text: `${text.slice(0, max)}…`, truncated: true, chars: text.length } : { text }
+}
+
 async function writeLive($: $): Promise<void> {
   const base = await dir($)
   await $.fs.write(
     `${base}/live/${await myId($)}.json`,
-    JSON.stringify({ sessionId: await myId($), cwd, busy, holding: holding ?? null, lastAnswer, lastTurnAt, updatedAt: Date.now(), model: await $.session.model().catch(() => undefined) }),
+    JSON.stringify({ sessionId: await myId($), cwd, busy, holding: holding ?? null, lastAnswer: clip(lastAnswer, ANSWER_CHARS).text, lastTurnAt, updatedAt: Date.now(), model: await $.session.model().catch(() => undefined) }),
   )
 }
 
@@ -219,7 +227,8 @@ async function tick($: $): Promise<void> {
     const every = control.reportEveryMin
     if (every && every > 0 && Date.now() - Math.max(lastReportAt, control.since) >= every * 60_000) {
       lastReportAt = Date.now()
-      await emit($, 'progress', { busy, holding: holding ?? null, lastAnswer, lastTurnAt })
+      const gist = clip(lastAnswer, GIST_CHARS)
+      await emit($, 'progress', { busy, holding: holding ?? null, lastAnswer: gist.text, ...(gist.truncated && { truncated: true }), lastTurnAt })
     }
     await flush($, false)
   } finally {
@@ -320,12 +329,20 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       busy = false
       lastTurnAt = Date.now()
-      lastAnswer = (e.answer ?? '').slice(0, ANSWER_CHARS)
+      lastAnswer = e.answer ?? ''
       if (control) {
         await writeLive($)
         const failed = e.reason === 'error' || e.reason === 'refusal'
-        await emit($, failed ? 'failed' : 'turn_done', { reason: e.reason, answer: lastAnswer, durationMs: e.durationMs })
+        const a = clip(lastAnswer, ANSWER_CHARS)
+        await emit($, failed ? 'failed' : 'turn_done', {
+          reason: e.reason,
+          answer: a.text,
+          ...(a.truncated && { truncated: true, answerChars: a.chars }),
+          ...(decision && { decision }),
+          durationMs: e.durationMs,
+        })
       }
+      decision = undefined
     }
     return r
   })
@@ -349,6 +366,15 @@ export const register: Register = on => {
     if (held.kind === 'released') return r
     const { decision, reason } = held.answer
     return { decision: decision === 'allow' ? 'allow' : 'deny', reason: reason ?? (decision === 'allow' ? 'Allowed through Clawd Bot' : 'Denied through Clawd Bot') }
+  })
+
+  on('tool.call', { tool: /^mcp__ccd_turn__wrap_up$/ }, async ($, e: any, next) => {
+    const r = await next(e)
+    if (e.agentId === undefined && typeof e.ask === 'string' && e.ask.trim()) {
+      const options = (Array.isArray(e.actions) ? e.actions : []).map((a: any) => a?.label ?? a?.action).filter((o: unknown): o is string => typeof o === 'string' && o.length > 0)
+      decision = { question: e.ask.slice(0, 300), options }
+    }
+    return r
   })
 
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {

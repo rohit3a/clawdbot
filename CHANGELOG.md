@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.3
+
+- A finished turn's answer reaches the bot whole up to 8,000 characters, up from 1,500. A longer one ends in "…" and its event says `truncated: true` with the full length, so the bot reads the rest with `peek` instead of asking the session to resend.
+- `peek` returns each message whole up to 8,000 characters, and marks a longer one as cut.
+- In the Claude desktop app, the question a session puts in its closing box reaches the bot with the turn, as `decision` with its options.
+- The Grok instructions and skills put every decision a session raises to the user as a tap-to-answer choice card, and send the pick back to the session. The events routine prompt is now v2.
+
 ## 0.4.2
 
 - An ask records its session's process id, and clawdctl drops an ask only when that process is gone. 0.4.1 judged by the waiting process instead, which has a moment between wait steps when none runs.

@@ -33,7 +33,7 @@ Steering needs the session taken over; clawdctl refuses otherwise, so offer to t
 - Permission mode: `permissions '<X>' acceptEdits` lets it edit files inside its folder without asking; `dontAsk` denies anything not already allowed, without asking; `default` goes back to asking. It lasts while you have the session. Plan, auto and bypass modes are set at the computer, not from here.
 
 ## Watch
-- "What did it say / what is it doing": `peek '<X>' --count 6` and summarise its last messages in two or three lines.
+- "What did it say / what is it doing": `peek '<X>' --count 6` and summarise its last messages in two or three lines. Each message holds up to 8,000 characters; one marked `truncated` is longer still. If its last reply puts a decision to the user, follow clawd-event, "Decisions in a reply".
 - Progress reports: `report '<X>' <minutes>` (or `off`). Each report arrives as an event.
 
 ## Stop

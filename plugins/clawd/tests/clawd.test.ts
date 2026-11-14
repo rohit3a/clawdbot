@@ -202,6 +202,39 @@ test('a turn that errors is pushed as failed, one that answers as done', async (
   expect(outbox(files).map(e => e.kind)).toEqual(expect.arrayContaining(['failed', 'turn_done']))
 })
 
+test('a long answer is cut at 8000 characters and the event says so', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, noWait)
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  await $.turn.complete({ turnId: 't1', answer: 'x'.repeat(9000), durationMs: 5, isAborted: false, reason: 'answer' })
+  await $.turn.complete({ turnId: 't2', answer: 'short', durationMs: 5, isAborted: false, reason: 'answer' })
+
+  const done = outbox(files) as unknown as { answer: string; truncated?: boolean; answerChars?: number }[]
+  const long = done.find(e => (e.answer?.length ?? 0) > 5)!
+  expect(long.answer.length).toBe(8001)
+  expect(long.truncated).toBe(true)
+  expect(long.answerChars).toBe(9000)
+  expect(done.find(e => e.answer === 'short')!.truncated).toBe(undefined)
+})
+
+test('the question in the desktop app\'s closing box goes to the bot with the turn', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, noWait)
+  on('turn.complete', () => ({ text: '' }))
+  on('tool.call', () => ({ result: 'shown' }))
+  await $.session.start({ cwd: CWD, surface: null, isInteractive: false })
+
+  await $.tool.call({ tool: 'mcp__ccd_turn__wrap_up', recap: 'Fixed.', ask: 'Ship 0.4.3?', actions: [{ label: 'Yes, ship it' }, { action: 'commit' }] } as never)
+  await $.turn.complete({ turnId: 't1', answer: 'Here is the fix.', durationMs: 5, isAborted: false, reason: 'answer' })
+  await $.turn.complete({ turnId: 't2', answer: 'Next turn.', durationMs: 5, isAborted: false, reason: 'answer' })
+
+  const done = outbox(files) as unknown as { answer: string; decision?: unknown }[]
+  expect(done.find(e => e.answer === 'Here is the fix.')!.decision).toEqual({ question: 'Ship 0.4.3?', options: ['Yes, ship it', 'commit'] })
+  expect(done.find(e => e.answer === 'Next turn.')!.decision).toBe(undefined)
+})
+
 test('an idle session pushes nothing when a turn fails', async ($, on) => {
   const files = new Map<string, string>()
   engine(on, files, noWait)

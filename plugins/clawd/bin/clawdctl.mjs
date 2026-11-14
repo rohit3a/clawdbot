@@ -15,6 +15,7 @@ const HOME = os.homedir();
 const DIR = process.env.CLAWD_HOME || path.join(HOME, '.clawd');
 const PUSH_GAP_MS = 20_000;
 const MAX_OUTBOX = 200;
+const PEEK_CHARS = 8000;
 const USER_PATH = process.env.PATH ?? '';
 process.env.PATH = [path.join(HOME, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH].join(path.delimiter);
 const CLAUDE = process.env.CLAUDE_BIN || 'claude';
@@ -90,7 +91,7 @@ function describe(a, asks) {
     effort: control?.effort,
     permissions: control?.permissions,
     asks: pending.map((k) => k.id),
-    lastAnswer: live?.lastAnswer ? live.lastAnswer.slice(0, 600) : undefined,
+    lastAnswer: live?.lastAnswer ? clip(live.lastAnswer, 600) : undefined,
   };
 }
 
@@ -378,19 +379,24 @@ function steer(ref, item) {
   return { session: a.sessionId, queued: item.type, note: 'The session picks this up within a few seconds.' };
 }
 
+function clip(text, max) {
+  const t = text ?? '';
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
 function line(e) {
   const who = `[${machine()}] ${e.name ?? path.basename(e.cwd ?? '') ?? e.sessionId?.slice(0, 8)}`;
   if (e.kind === 'ask' && e.ask === 'permission') return `${who} wants permission for ${e.tool}: ${e.summary} (ask ${e.askId}, mode ${e.mode})`;
   if (e.kind === 'ask') return `${who} asks: ${(e.questions ?? []).map((q) => `${q.question} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`).join(' ')} (ask ${e.askId}, mode ${e.mode})`;
-  if (e.kind === 'turn_done' && e.reason === 'aborted') return `${who} was interrupted. It had got to: ${(e.answer ?? '').slice(0, 300)}`;
-  if (e.kind === 'turn_done') return `${who} finished a turn: ${(e.answer ?? '').slice(0, 300)}`;
+  if (e.kind === 'turn_done' && e.reason === 'aborted') return `${who} was interrupted. It had got to: ${clip(e.answer, 300)}`;
+  if (e.kind === 'turn_done') return `${who} finished a turn: ${clip(e.answer, 300)}${e.truncated ? ` [answer cut: ${e.answerChars} chars, peek for the rest]` : ''}${e.decision ? ` Decision for the person: ${e.decision.question} [${e.decision.options.join(' / ')}]` : ''}`;
   if (e.kind === 'takeover') return `${who}: Clawd Bot has this session now (${e.by === 'you' ? 'handed over at the machine' : 'taken over by the bot'}, mode ${e.mode}).`;
   if (e.kind === 'released') return `${who} is back with the person at the machine. Its asks show there again.`;
   if (e.kind === 'test') return `[${machine()}] Clawd Bot is connected.`;
   if (e.kind === 'ended') return `${who} ended.`;
   if (e.kind === 'steer_failed') return `${who} could not run on ${[e.model, e.effort].filter(Boolean).join(' ')}; it went back to its own model and effort.`;
-  if (e.kind === 'failed') return `${who} failed (${e.reason}): ${(e.answer ?? '').slice(0, 300)}`;
-  if (e.kind === 'progress') return `${who} progress: ${e.busy ? 'working' : 'idle'}${e.holding ? `, waiting on ${e.holding}` : ''}. Last: ${(e.lastAnswer ?? '').slice(0, 300)}`;
+  if (e.kind === 'failed') return `${who} failed (${e.reason}): ${clip(e.answer, 300)}`;
+  if (e.kind === 'progress') return `${who} progress: ${e.busy ? 'working' : 'idle'}${e.holding ? `, waiting on ${e.holding}` : ''}. Last: ${clip(e.lastAnswer, 300)}`;
   return `${who} ${e.kind}`;
 }
 
@@ -453,7 +459,7 @@ function lastMessages(file, n) {
     const c = row.message?.content;
     const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b.type === 'text').map((b) => b.text).join('\n') : '';
     if (!text.trim() || text.startsWith('<')) continue;
-    out.push({ role: row.type, at: row.timestamp, text: text.slice(0, 1500) });
+    out.push({ role: row.type, at: row.timestamp, text: clip(text, PEEK_CHARS), ...(text.length > PEEK_CHARS && { truncated: true, chars: text.length }) });
   }
   return out.reverse();
 }
