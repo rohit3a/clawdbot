@@ -9,7 +9,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const HOME = os.homedir();
 const DIR = process.env.CLAWD_HOME || path.join(HOME, '.clawd');
 const PUSH_GAP_MS = 20_000;
@@ -456,7 +456,7 @@ function serve({ host, port }) {
   server.listen(p, bind, () => process.stderr.write(`clawd MCP listening on http://${bind}:${p}/mcp\n`));
 }
 
-// the plugin cache folder changes with every version; the mod rewrites plugin-root at each session start
+// run from the marketplace copy, which `claude plugin marketplace update` keeps current, not a versioned cache folder
 function link() {
   const root = path.dirname(path.dirname(fs.realpathSync(process.argv[1])));
   fs.writeFileSync(sub('plugin-root'), root);

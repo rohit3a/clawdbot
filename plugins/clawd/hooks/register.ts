@@ -243,7 +243,6 @@ export const register: Register = on => {
     const base = await dir($)
     const left = await $.fs.list(`${base}/outbox`).catch(() => [])
     unsent = left.some(f => f.name.endsWith('.json'))
-    if ((await $.fs.read(`${base}/plugin-root`).catch(() => '')) !== $.plugin.root) await $.fs.write(`${base}/plugin-root`, $.plugin.root).catch(() => undefined)
     $.clock.every(TICK_MS, () => void tick($).catch(() => undefined))
     await $.command.register({
       name: 'clawd',

@@ -40,10 +40,10 @@ claude plugin marketplace add rohit3a/clawdbot
 claude plugin install clawd@clawdbot
 ```
 
-Open a Claude Code session once, so the mod records where it is installed. Then put `clawdctl` on your PATH:
+Then put `clawdctl` on your PATH:
 
 ```bash
-node "$(cat ~/.clawd/plugin-root)/bin/clawdctl.mjs" link
+node ~/.claude/plugins/marketplaces/clawdbot/plugins/clawd/bin/clawdctl.mjs link
 ```
 
 `clawdctl info` should now print the machine name and your Claude Code version. To give the machine a friendlier name:
@@ -76,6 +76,18 @@ clawdctl config webhook --url https://example.com/your-hook --key-stdin < keyfil
 ```
 
 Each push is a JSON POST of `{ machine, sentAt, events, text }`, where `text` is one readable line per event. Pushes are batched at least 20 seconds apart, and retried less and less often while the webhook fails. `clawdctl config webhook --off` stops them.
+
+To update later:
+
+```bash
+claude plugin marketplace update clawdbot
+```
+
+```bash
+claude plugin update clawd@clawdbot
+```
+
+`clawdctl` updates at once; sessions load the new mod when they next start.
 
 ## In the session
 

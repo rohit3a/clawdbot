@@ -39,7 +39,7 @@ Each clawdctl command passes Auto-review unless a rule allows it. Suggest the us
 Per computer: `~/.local/bin/clawdctl info` (versions, `webhook: true` when events are connected) and `~/.local/bin/clawdctl asks` (open asks). Report one line per computer.
 
 ## Update
-On each computer: `claude plugin marketplace update clawdbot`, then `claude plugin update clawd@clawdbot`, then `~/.local/bin/clawdctl info`. Sessions load the new version when they next start.
+On each computer: `claude plugin marketplace update clawdbot`, then `claude plugin update clawd@clawdbot`, then `~/.local/bin/clawdctl info`. clawdctl updates at once; sessions load the new mod when they next start. If `info` shows the old version, run step 3 of "Install on a computer" again.
 
 ## Routine prompt
 Use the block below verbatim, from "Clawd events routine v1." to the end.
