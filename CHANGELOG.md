@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1
+
+- CI wake also covers checks that had already failed when the turn ended. Each commit is reported once.
+- A scheduled task on macOS runs before it removes its own launchd job. Before, removing the job first stopped the run.
+
 ## 0.6.0
 
 - A plan waiting for approval reaches the bot whole. The bot approves it, or sends it back with the changes wanted.

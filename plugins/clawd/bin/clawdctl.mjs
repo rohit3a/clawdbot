@@ -389,7 +389,8 @@ const commands = {
     const pr = prOf(cwd);
     if (pr) {
       out.pr = pr;
-      if (pr.checks?.pending && session) ciWatchLater(session, cwd, pr);
+      // still running, or already failed before the turn ended: either way the watcher reports it, once per commit
+      if ((pr.checks?.pending || pr.checks?.fail) && session) ciWatchLater(session, cwd, pr);
     }
     return out;
   },
@@ -430,27 +431,13 @@ const commands = {
     const t = readJson(sub('schedule', `${id}.json`));
     if (!t) return { id, note: 'Already run or cancelled.' };
     fs.rmSync(sub('schedule', `${id}.json`), { force: true });
-    try { removeTimer(t); } catch {}
-    let event;
-    if (t.session) {
-      const c = controlOf(t.session);
-      if (c) writeJson(sub('inbox', t.session, `${Date.now()}-${randomBytes(3).toString('hex')}.json`), { type: 'message', text: t.prompt });
-      event = c ? { kind: 'scheduled', taskId: id, sessionId: t.session, sent: true } : { kind: 'scheduled', taskId: id, sessionId: t.session, failed: 'The session is no longer taken over, so the message was not sent.' };
-      queueEvent(event);
-      await commands.flush({ quiet: true });
-      return event;
-    }
+    // the timer goes last: on macOS removing the launchd job ends this very process
     try {
-      const started = await commands.start({ folder: t.folder, prompt: t.prompt, name: t.name, model: t.model, effort: t.effort, mode: t.mode });
-      event = { kind: 'scheduled', taskId: id, sessionId: started.session, started };
-    } catch (e) {
-      event = { kind: 'scheduled', taskId: id, failed: e.message, folder: t.folder };
+      return await runTask(id, t);
+    } finally {
+      try { removeTimer(t); } catch {}
     }
-    queueEvent(event);
-    await commands.flush({ quiet: true });
-    return event;
   },
-
   async flush({ quiet }) {
     ensureDirs();
     const lock = sub('push.lock');
@@ -495,6 +482,30 @@ const commands = {
     }
   },
 };
+
+// a scheduled task: a message to a session the bot still has, or a new background session
+async function runTask(id, t) {
+  {
+    let event;
+    if (t.session) {
+      const c = controlOf(t.session);
+      if (c) writeJson(sub('inbox', t.session, `${Date.now()}-${randomBytes(3).toString('hex')}.json`), { type: 'message', text: t.prompt });
+      event = c ? { kind: 'scheduled', taskId: id, sessionId: t.session, sent: true } : { kind: 'scheduled', taskId: id, sessionId: t.session, failed: 'The session is no longer taken over, so the message was not sent.' };
+      queueEvent(event);
+      await commands.flush({ quiet: true });
+      return event;
+    }
+    try {
+      const started = await commands.start({ folder: t.folder, prompt: t.prompt, name: t.name, model: t.model, effort: t.effort, mode: t.mode });
+      event = { kind: 'scheduled', taskId: id, sessionId: started.session, started };
+    } catch (e) {
+      event = { kind: 'scheduled', taskId: id, failed: e.message, folder: t.folder };
+    }
+    queueEvent(event);
+    await commands.flush({ quiet: true });
+    return event;
+  }
+}
 
 // Events that arrive inside the gap, or that a failing webhook refused, go out from one detached
 // process, so they don't wait for the session that queued them, which may have ended.
@@ -625,9 +636,10 @@ function ciWatchLater(sessionId, cwd, pr) {
 
 async function ciWatch({ session, cwd, pr, sha }) {
   const started = Date.now();
+  let reported = false;
   try {
-    while (Date.now() - started < CI_MAX_MS) {
-      await new Promise((r) => setTimeout(r, CI_POLL_MS));
+    for (let first = true; Date.now() - started < CI_MAX_MS; first = false) {
+      if (!first) await new Promise((r) => setTimeout(r, CI_POLL_MS));
       const now = prOf(cwd);
       if (!now || String(now.number) !== String(pr) || (sha && now.sha && now.sha !== sha)) return;
       if (!now.checks || now.checks.pending) continue;
@@ -645,11 +657,13 @@ async function ciWatch({ session, cwd, pr, sha }) {
         writeJson(sub('inbox', session, `${Date.now()}-${randomBytes(3).toString('hex')}.json`), { type: 'message', text: `CI failed on PR #${pr} (${names}). Read the failure (gh pr checks ${pr}, then gh run view <run id> --log-failed), fix it, and push.` });
       }
       queueEvent({ kind: 'ci', sessionId: session, cwd, pr: { number: now.number, url: now.url }, state: failed ? 'fail' : 'pass', failing, woke: wake });
+      reported = true;
       await commands.flush({ quiet: true });
       return;
     }
   } finally {
-    fs.rmSync(sub('ci', `${session}-${sha || pr}`), { recursive: true, force: true });
+    // a reported commit keeps its mark, so later turns on the same commit don't report or wake again
+    if (!reported) fs.rmSync(sub('ci', `${session}-${sha || pr}`), { recursive: true, force: true });
   }
 }
 
@@ -704,8 +718,8 @@ function installTimer(t) {
 function removeTimer(t) {
   if (process.env.CLAWD_NO_TIMER) return;
   if (process.platform === 'darwin') {
-    try { execFileSync('launchctl', ['bootout', `gui/${process.getuid()}/com.clawd.${t.id}`], { stdio: 'ignore', timeout: 15_000 }); } catch {}
     fs.rmSync(plistOf(t.id), { force: true });
+    try { execFileSync('launchctl', ['bootout', `gui/${process.getuid()}/com.clawd.${t.id}`], { stdio: 'ignore', timeout: 15_000 }); } catch {}
   } else {
     try { execFileSync('systemctl', ['--user', 'stop', `clawd-${t.id}.timer`], { stdio: 'ignore', timeout: 15_000 }); } catch {}
   }

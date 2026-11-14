@@ -59,6 +59,7 @@ const queue = (kind, extra = {}) => {
   const id = `${kind}-${Math.random().toString(36).slice(2)}`;
   fs.writeFileSync(path.join(dir, 'outbox', `${id}.json`), JSON.stringify({ id, at: Date.now(), kind, sessionId: SESSION, ...extra }));
 };
+const listOutbox = () => { try { return fs.readdirSync(path.join(dir, 'outbox')).map((n) => read('outbox', n)); } catch { return []; } };
 const until = async (check, ms = 10_000) => {
   for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 100))) if (check()) return;
   assert.fail('timed out');
@@ -373,6 +374,35 @@ test('git-summary names the branch, the turn\'s commits and what changed', async
   assert.match(r.commits[0], /second$/);
   assert.deepEqual(r.changed, { files: 2, insertions: 2, deletions: 0 });
   assert.deepEqual((await clawdctl(['git-summary', '--cwd', root])).json, {});
+});
+
+test('a PR whose checks already failed wakes the session once per commit', async () => {
+  await clawdctl(['take-over', 'api-fix']);
+  const repo = fs.mkdtempSync(path.join(root, 'repo-'));
+  execFileSync('git', ['-C', repo, 'init', '-q', '-b', 'fix']);
+  execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'start']);
+  const bin = path.join(home, '.local', 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh
+case "$2" in
+  view) echo '{"number":9,"url":"https://github.com/o/r/pull/9","state":"OPEN","headRefOid":"abc123","statusCheckRollup":[{"conclusion":"FAILURE"},{"conclusion":"SUCCESS"}]}' ;;
+  checks) echo '[{"name":"test (ubuntu)","bucket":"fail","link":"https://x/1"},{"name":"lint","bucket":"pass","link":"https://x/2"}]' ;;
+esac
+`, { mode: 0o755 });
+
+  const r = (await clawdctl(['git-summary', '--cwd', repo, '--session', SESSION])).json;
+  assert.deepEqual(r.pr.checks, { pass: 1, fail: 1, pending: 0 });
+  await until(() => fs.existsSync(path.join(dir, 'inbox', SESSION)) && fs.readdirSync(path.join(dir, 'inbox', SESSION)).length === 1);
+  const [msg] = fs.readdirSync(path.join(dir, 'inbox', SESSION));
+  assert.match(read('inbox', SESSION, msg).text, /CI failed on PR #9 \(test \(ubuntu\)\)/);
+  await until(() => listOutbox().some((e) => e.kind === 'ci'));
+  const ci = listOutbox().find((e) => e.kind === 'ci');
+  assert.equal(ci.state, 'fail');
+  assert.equal(ci.woke, true);
+
+  await clawdctl(['git-summary', '--cwd', repo, '--session', SESSION]);
+  await new Promise((r) => setTimeout(r, 1500));
+  assert.equal(fs.readdirSync(path.join(dir, 'inbox', SESSION)).length, 1);
 });
 
 test('a scheduled task is listed, can be cancelled, and refuses a time already past', async () => {
