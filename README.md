@@ -69,7 +69,7 @@ Any agent that speaks MCP can drive clawdctl. Pick the link that fits where your
 | On the same machine | the stdio server: `clawdctl mcp` |
 | Elsewhere, over SSH | the stdio server through SSH: `ssh <host> clawdctl mcp` |
 | Elsewhere, on your tailnet | the HTTP server: `clawdctl serve`, then `http://<machine>:7477/mcp` with the key |
-| In Grok Bot | its device link running clawdctl commands, or its Tailscale plugin pointed at `clawdctl serve` |
+| In Grok Bot | its device link running clawdctl commands (the Clawd Bot template does this) |
 
 `clawdctl serve` binds to the machine's Tailscale address by default, never to all interfaces, and refuses any request without the bearer key from `~/.clawd/serve.key`. Copy that key into your bot's connector settings yourself; don't paste it into a chat.
 

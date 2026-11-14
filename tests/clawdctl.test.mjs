@@ -37,7 +37,7 @@ esac
 function clawdctl(args, { input } = {}) {
   return new Promise((resolve) => {
     const child = execFile(process.execPath, [CLAWDCTL, ...args], {
-      env: { ...process.env, CLAWD_NO_TIMER: '1', HOME: home, CLAWD_HOME: dir, CLAUDE_BIN: path.join(root, 'claude'), CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+      env: { ...process.env, CLAWD_NO_TIMER: '1', CLAWD_TAKEOVER_WAIT_MS: '0', HOME: home, CLAWD_HOME: dir, CLAUDE_BIN: path.join(root, 'claude'), CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
       timeout: 20_000,
     }, (err, stdout, stderr) => {
       let json;
@@ -395,6 +395,43 @@ test('a scheduled task that runs pushes a scheduled event', async () => {
   assert.equal(received[0].body.events[0].kind, 'scheduled');
   assert.equal(received[0].body.events[0].taskId, json.id);
   assert.equal((await clawdctl(['schedules'])).json.tasks.length, 0);
+});
+
+test('a take-over the session never picks up says it needs a restart', async () => {
+  const r = await clawdctl(['take-over', 'api-fix']);
+  assert.equal(r.json.pickedUp, false);
+  assert.match(r.json.note, /restart it/);
+  fs.mkdirSync(path.join(dir, 'live'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'live', `${SESSION}.json`), '{}');
+  assert.equal((await clawdctl(['take-over', 'api-fix'])).json.pickedUp, true);
+});
+
+test('allow can be remembered for the session; deny cannot', async () => {
+  writeAsk({ id: 'permission-r', kind: 'permission', tool: 'Bash' });
+  await clawdctl(['answer', 'permission-r', '--decision', 'allow', '--remember']);
+  assert.deepEqual(read('answers', 'permission-r.json'), { decision: 'allow', remember: true });
+  writeAsk({ id: 'permission-d', kind: 'permission', tool: 'Bash' });
+  await clawdctl(['answer', 'permission-d', '--decision', 'deny', '--remember']);
+  assert.deepEqual(read('answers', 'permission-d.json'), { decision: 'deny' });
+});
+
+test('a file put from the chat can be attached to a message, and nothing else can', async () => {
+  await clawdctl(['take-over', 'api-fix']);
+  const put = await clawdctl(['put', 'shot.png', '--base64-stdin'], { input: Buffer.from('png-bytes').toString('base64') });
+  assert.equal(fs.readFileSync(put.json.path, 'utf8'), 'png-bytes');
+  await clawdctl(['send', 'api-fix', 'What is wrong here?', '--file', put.json.path]);
+  const [msg] = fs.readdirSync(path.join(dir, 'inbox', SESSION));
+  assert.match(read('inbox', SESSION, msg).text, /What is wrong here\?\n\nAttached by the person through Clawd Bot: .*shot\.png/);
+  assert.equal((await clawdctl(['send', 'api-fix', 'x', '--file', CLAWDCTL])).code, 1);
+});
+
+test('a scheduled message reaches a session the bot still has', async () => {
+  await clawdctl(['take-over', 'api-fix']);
+  const { json } = await clawdctl(['schedule', '--at', '+1h', '--session', 'api-fix', '--prompt', 'The limit has reset: carry on.']);
+  assert.equal(json.session, SESSION);
+  await clawdctl(['run-scheduled', json.id]);
+  const [msg] = fs.readdirSync(path.join(dir, 'inbox', SESSION));
+  assert.equal(read('inbox', SESSION, msg).text, 'The limit has reset: carry on.');
 });
 
 test('a refused push keeps the events for the next try', async () => {

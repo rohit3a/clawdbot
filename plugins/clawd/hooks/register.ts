@@ -10,7 +10,7 @@ type Steer = { type: 'message'; text: string } | { type: 'interrupt' } | { type:
 type GrokOptIn = { enabled: boolean; perHour?: number }
 type RequestAnswer = { result?: string; declined?: string }
 type GitSummary = { branch?: string; commits?: string[]; changed?: { files: number; insertions: number; deletions: number }; pr?: { number: number; url: string; state: string; checks?: { pass: number; fail: number; pending: number } } }
-type PermissionAnswer = { decision: 'allow' | 'deny'; reason?: string }
+type PermissionAnswer = { decision: 'allow' | 'deny'; reason?: string; remember?: boolean }
 type QuestionAnswer = { answers: Record<string, string> }
 type Held<A> = { kind: 'answered'; answer: A } | { kind: 'released' }
 
@@ -55,6 +55,9 @@ let grokTimes: number[] = []
 let wantRemote = false
 // the budget level already announced for the current budget: warned at 80%, stopped at 100%
 let budgetSaid: { budget: number; level: 'warn' | 'stopped' } | undefined
+// permissions the bot allowed for the rest of the session: a Bash command exactly, any other tool by name
+const allowedForSession = new Set<string>()
+let contextSaid = false
 
 const MEDIA = /\.(png|jpe?g|gif|webp|svg|mp4|mov|webm|pdf)$/i
 const URLS = /https?:\/\/[^\s<>"'`()[\]{}]+/g
@@ -144,7 +147,7 @@ async function writeLive($: $): Promise<void> {
   const base = await dir($)
   await $.fs.write(
     `${base}/live/${await myId($)}.json`,
-    JSON.stringify({ sessionId: await myId($), cwd, busy, holding: holding ?? null, lastAnswer: clip(lastAnswer, ANSWER_CHARS).text, lastTurnAt, costUsd: lastCost, updatedAt: Date.now(), model: await $.session.model().catch(() => undefined) }),
+    JSON.stringify({ sessionId: await myId($), cwd, busy, holding: holding ?? null, lastAnswer: clip(lastAnswer, ANSWER_CHARS).text, lastTurnAt, turnStartedAt, costUsd: lastCost, updatedAt: Date.now(), model: await $.session.model().catch(() => undefined) }),
   )
 }
 
@@ -173,6 +176,8 @@ function byPermissions(c: Control, tool: string, input: unknown): { decision: 'a
 
 function summarize(tool: string, input: unknown): string {
   const i = (input ?? {}) as Record<string, unknown>
+  // a plan comes whole, so the bot can show what it is approving
+  if (tool === 'ExitPlanMode' && typeof i.plan === 'string') return clip(i.plan, ANSWER_CHARS).text
   if (tool === 'Bash' && typeof i.command === 'string') return i.command.slice(0, 500)
   if (typeof i.file_path === 'string') {
     const size = typeof i.content === 'string' ? ` (${i.content.length} chars)` : ''
@@ -299,6 +304,7 @@ async function tick($: $): Promise<void> {
       // a terminal session gets a Remote Control link so the person can open it from the phone or the web
       if (await onTerminal($)) wantRemote = true
     } else if (was && !control) {
+      allowedForSession.clear()
       showStatus($)
       await removeFiles($, [`${await dir($)}/live/${await myId($)}.json`])
       await emit($, 'released', {})
@@ -453,8 +459,16 @@ export const register: Register = on => {
         const links = [...new Set([...linksIn(lastAnswer), ...turnLinks])].slice(0, MAX_LINKS)
         const media = [...new Set([...turnMedia, ...mediaIn(lastAnswer)])].slice(0, MAX_MEDIA)
         const git: GitSummary | undefined = await clawdctl($, ['git-summary', '--cwd', cwd, ...(turnHead ? ['--since', turnHead] : []), '--session', await myId($)])
-        const costUsd = await cost($)
+        const usage = await $.session.usage().catch(() => undefined)
+        const usd = usage?.cost?.usd
+        const costUsd = typeof usd === 'number' ? Math.round(usd * 100) / 100 : undefined
         lastCost = costUsd
+        const contextPercent = typeof usage?.context?.percent === 'number' ? Math.round(usage.context.percent) : undefined
+        if (contextPercent !== undefined && contextPercent < 50) contextSaid = false
+        if (contextPercent !== undefined && contextPercent >= 80 && !contextSaid) {
+          contextSaid = true
+          await emit($, 'context', { contextPercent })
+        }
         await emit($, failed ? 'failed' : 'turn_done', {
           reason: e.reason,
           answer: a.text,
@@ -464,6 +478,7 @@ export const register: Register = on => {
           ...(media.length && { media, mediaSince: turnStartedAt }),
           ...(git && Object.keys(git).length && { git }),
           ...(costUsd !== undefined && { costUsd }),
+          ...(contextPercent !== undefined && { contextPercent }),
           ...(control.budgetUsd && { budgetUsd: control.budgetUsd }),
           durationMs: e.durationMs,
         })
@@ -491,9 +506,13 @@ export const register: Register = on => {
     if (!control) return r
     const set = byPermissions(control, e.tool, e.input)
     if (set) return set
-    const held = await hold<PermissionAnswer>($, 'permission', { tool: e.tool, summary: summarize(e.tool, e.input), reason: r.reason ?? null, subagent: e.agentId ?? null }, `${e.tool} permission`)
+    const summary = summarize(e.tool, e.input)
+    const key = e.tool === 'Bash' ? `Bash:${summary}` : e.tool
+    if (allowedForSession.has(key)) return { decision: 'allow', reason: 'Allowed for this session through Clawd Bot' }
+    const held = await hold<PermissionAnswer>($, 'permission', { tool: e.tool, summary, reason: r.reason ?? null, subagent: e.agentId ?? null }, `${e.tool} permission`)
     if (held.kind === 'released') return r
-    const { decision, reason } = held.answer
+    const { decision, reason, remember } = held.answer
+    if (decision === 'allow' && remember) allowedForSession.add(key)
     return { decision: decision === 'allow' ? 'allow' : 'deny', reason: reason ?? (decision === 'allow' ? 'Allowed through Clawd Bot' : 'Denied through Clawd Bot') }
   })
 

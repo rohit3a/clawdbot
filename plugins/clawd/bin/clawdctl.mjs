@@ -31,7 +31,7 @@ const refuse = (message) => { throw new Refusal(message); };
 
 const sub = (...p) => path.join(DIR, ...p);
 function ensureDirs() {
-  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
+  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci', 'files']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
 }
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; }
@@ -97,6 +97,8 @@ function describe(a, asks) {
     asks: pending.map((k) => k.id),
     lastAnswer: live?.lastAnswer ? clip(live.lastAnswer, 600) : undefined,
     costUsd: live?.costUsd,
+    workingMin: live?.busy && live.turnStartedAt ? Math.floor((Date.now() - live.turnStartedAt) / 60_000) : undefined,
+    idleMin: live && !live.busy && live.lastTurnAt ? Math.floor((Date.now() - live.lastTurnAt) / 60_000) : undefined,
     budgetUsd: control?.budgetUsd,
     askGrok: readJson(sub('grok', `${a.sessionId}.json`))?.enabled ? true : undefined,
     remoteUrl: control ? remoteUrlOf(a.sessionId) : undefined,
@@ -168,11 +170,16 @@ const commands = {
     return { machine: machine(), session: sessionId ?? null, shortId, name: label, folder: cwd, takenOver: true, remoteUrl, attach: shortId ? `claude attach ${shortId}` : undefined, resume: sessionId ? `claude --resume ${sessionId}` : undefined };
   },
 
-  take_over({ session, mode }) {
+  async take_over({ session, mode }) {
     const a = resolve(session);
     const now = controlOf(a.sessionId);
     writeJson(sub('control', `${a.sessionId}.json`), { takenOver: true, mode: mode === 'babysit' ? 'babysit' : mode === 'handle' ? 'handle' : now?.mode ?? 'handle', by: 'bot', since: now?.since ?? Date.now(), reportEveryMin: now?.reportEveryMin });
-    return { session: a.sessionId, name: a.name, takenOver: true, note: 'The session mod picks this up within a few seconds. Questions and permissions now come to you.' };
+    // the mod answers by writing the session's live file; a session opened before Clawd was installed never does
+    const live = sub('live', `${a.sessionId}.json`);
+    const wait = Number(process.env.CLAWD_TAKEOVER_WAIT_MS ?? 8_000);
+    for (const end = Date.now() + wait; Date.now() < end && !fs.existsSync(live); ) await new Promise((r) => setTimeout(r, 250));
+    if (!fs.existsSync(live)) return { session: a.sessionId, name: a.name, takenOver: true, pickedUp: false, note: 'The session has not picked this up. It was probably opened before Clawd was installed or updated: restart it (claude --resume ' + a.sessionId + ') and it will be yours.' };
+    return { session: a.sessionId, name: a.name, takenOver: true, pickedUp: true, note: 'Questions and permissions now come to you.' };
   },
 
   release({ session }) {
@@ -222,12 +229,12 @@ const commands = {
     return { machine: machine(), installed: plugin?.version ?? null, latest, updateAvailable: newer(latest, plugin?.version), update: 'claude plugin marketplace update clawdbot && claude plugin update clawd@clawdbot' };
   },
 
-  answer({ ask, decision, reason, pick, answers }) {
+  answer({ ask, decision, reason, pick, answers, remember }) {
     const k = readJson(sub('asks', `${ask}.json`)) ?? refuse(`No open ask ${ask}. It may already be answered or withdrawn.`);
     let body;
     if (k.kind === 'permission') {
       if (decision !== 'allow' && decision !== 'deny') refuse('A permission is answered with decision allow or deny.');
-      body = { decision, ...(reason ? { reason } : {}) };
+      body = { decision, ...(reason ? { reason } : {}), ...(remember && decision === 'allow' ? { remember: true } : {}) };
     } else {
       const parsed = typeof answers === 'string' ? JSON.parse(answers) : answers;
       const questions = k.questions ?? [];
@@ -248,9 +255,35 @@ const commands = {
     return { ask, answered: body };
   },
 
-  send({ session, text }) {
-    if (!text) refuse('Give the message text.');
+  send({ session, text, file }) {
+    if (!text && !file) refuse('Give the message text.');
+    if (file) {
+      const f = fs.realpathSync(file);
+      if (!f.startsWith(`${fs.realpathSync(sub('files'))}${path.sep}`)) refuse('Attach a file put on this computer with clawdctl put.');
+      text = `${text ?? 'See the attached file.'}\n\nAttached by the person through Clawd Bot: ${f} (read it with the Read tool).`;
+    }
     return steer(session, { type: 'message', text });
+  },
+
+  // a file from the chat (a screenshot, a document) onto this computer, for send --file
+  async put({ name, url, base64Stdin }) {
+    const safe = path.basename(String(name || 'file')).replace(/[^\w.-]+/g, '-').slice(0, 80) || 'file';
+    let bytes;
+    if (url) {
+      if (!/^https:\/\//.test(url)) refuse('Only https links.');
+      const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+      if (!res.ok) refuse(`The link answered ${res.status}.`);
+      bytes = Buffer.from(await res.arrayBuffer());
+    } else if (base64Stdin) {
+      let b64 = '';
+      for await (const chunk of process.stdin) b64 += chunk;
+      bytes = Buffer.from(b64.replace(/\s+/g, ''), 'base64');
+    } else refuse('Give --url <https link> or --base64-stdin.');
+    if (bytes.length > 20 * 1024 * 1024) refuse('Files up to 20 MB.');
+    const file = sub('files', `${Date.now().toString(36)}-${safe}`);
+    fs.mkdirSync(sub('files'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, bytes, { mode: 0o600 });
+    return { path: file, bytes: bytes.length, note: 'Send it with clawdctl send <session> <text> --file <path>.' };
   },
   interrupt({ session }) { return steer(session, { type: 'interrupt' }); },
   set_model({ session, model }) {
@@ -374,14 +407,15 @@ const commands = {
   },
 
   // --- scheduled tasks: a background session started later by the OS timer ---
-  schedule({ at, folder, prompt, name, model, effort, mode }) {
-    if (!folder || !prompt) refuse('A scheduled task needs a folder and a prompt.');
+  schedule({ at, folder, prompt, name, model, effort, mode, session }) {
+    if (!prompt || (!folder && !session)) refuse('A scheduled task needs a prompt, and a folder to start in or a session to message.');
+    const target = session ? resolve(session) : undefined;
     const when = whenOf(at);
     const id = `task-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`;
-    const task = { id, at: when, folder, prompt, name, model, effort, mode, createdAt: Date.now() };
+    const task = target ? { id, at: when, session: target.sessionId, name: target.name, prompt, createdAt: Date.now() } : { id, at: when, folder, prompt, name, model, effort, mode, createdAt: Date.now() };
     writeJson(sub('schedule', `${id}.json`), task);
     try { installTimer(task); } catch (e) { fs.rmSync(sub('schedule', `${id}.json`), { force: true }); refuse(`Could not set the timer: ${e.message}`); }
-    return { id, at: new Date(when).toString(), folder, name: name ?? null, note: 'A background session starts then, taken over by you, and its start arrives as an event.' };
+    return { id, at: new Date(when).toString(), folder: task.folder, session: task.session, name: task.name ?? null, note: task.session ? 'The message is sent to the session then, if you still have it.' : 'A background session starts then, taken over by you, and its start arrives as an event.' };
   },
   schedules() {
     return { machine: machine(), tasks: listJson(sub('schedule')).map((n) => readJson(sub('schedule', n))).filter(Boolean).map((t) => ({ ...t, at: new Date(t.at).toString() })) };
@@ -398,6 +432,14 @@ const commands = {
     fs.rmSync(sub('schedule', `${id}.json`), { force: true });
     try { removeTimer(t); } catch {}
     let event;
+    if (t.session) {
+      const c = controlOf(t.session);
+      if (c) writeJson(sub('inbox', t.session, `${Date.now()}-${randomBytes(3).toString('hex')}.json`), { type: 'message', text: t.prompt });
+      event = c ? { kind: 'scheduled', taskId: id, sessionId: t.session, sent: true } : { kind: 'scheduled', taskId: id, sessionId: t.session, failed: 'The session is no longer taken over, so the message was not sent.' };
+      queueEvent(event);
+      await commands.flush({ quiet: true });
+      return event;
+    }
     try {
       const started = await commands.start({ folder: t.folder, prompt: t.prompt, name: t.name, model: t.model, effort: t.effort, mode: t.mode });
       event = { kind: 'scheduled', taskId: id, sessionId: started.session, started };
@@ -687,7 +729,9 @@ function extras(e) {
 
 function line(e) {
   const who = `[${machine()}] ${e.name ?? path.basename(e.cwd ?? '') ?? e.sessionId?.slice(0, 8)}`;
-  if (e.kind === 'ask' && e.ask === 'permission') return `${who} wants permission for ${e.tool}: ${e.summary} (ask ${e.askId}, mode ${e.mode})`;
+  if (e.kind === 'ask' && e.ask === 'permission' && e.tool === 'ExitPlanMode') return `${who} has a plan for approval (ask ${e.askId}, mode ${e.mode}): ${clip(e.summary, 600)}`;
+  if (e.kind === 'ask' && e.ask === 'permission') return `${who} wants permission for ${e.tool}: ${clip(e.summary, 600)} (ask ${e.askId}, mode ${e.mode})`;
+  if (e.kind === 'context') return `${who} has used ${e.contextPercent}% of its context; it will compact soon.`;
   if (e.kind === 'ask') return `${who} asks: ${(e.questions ?? []).map((q) => `${q.question} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`).join(' ')} (ask ${e.askId}, mode ${e.mode})`;
   if (e.kind === 'turn_done' && e.reason === 'aborted') return `${who} was interrupted. It had got to: ${clip(e.answer, 300)}`;
   if (e.kind === 'turn_done') return `${who} finished a turn: ${clip(e.answer, 300)}${e.truncated ? ` [answer cut: ${e.answerChars} chars, peek for the rest]` : ''}${e.decision ? ` Decision for the person: ${e.decision.question} [${e.decision.options.join(' / ')}]` : ''}${extras(e)}`;
@@ -701,6 +745,7 @@ function line(e) {
   if (e.kind === 'remote') return e.remoteUrl ? `${who} Remote Control: ${e.remoteUrl}` : `${who}: Remote Control could not be turned on here.`;
   if (e.kind === 'ci') return `${who} CI ${e.state === 'fail' ? 'failed' : 'passed'} on PR #${e.pr?.number} ${e.pr?.url ?? ''}${e.failing?.length ? ` (${e.failing.map((f) => f.name).join(', ')})` : ''}${e.woke ? '. The session was woken to fix it.' : ''}`;
   if (e.kind === 'budget') return `${who} ${e.level === 'stopped' ? 'stopped at its budget' : 'is at 80% of its budget'}: $${e.costUsd} of $${e.budgetUsd}.`;
+  if (e.kind === 'scheduled' && e.sent) return `${who} got its scheduled message (task ${e.taskId}).`;
   if (e.kind === 'scheduled') return e.failed ? `[${machine()}] Scheduled task ${e.taskId} did not start: ${e.failed}` : `[${machine()}] Scheduled task ${e.taskId} started ${e.started?.name ?? ''}${e.started?.remoteUrl ? `: ${e.started.remoteUrl}` : ''}`;
   if (e.kind === 'progress') return `${who} progress: ${e.busy ? 'working' : 'idle'}${e.holding ? `, waiting on ${e.holding}` : ''}. Last: ${clip(e.lastAnswer, 300)}`;
   return `${who} ${e.kind}`;
@@ -782,8 +827,9 @@ const TOOLS = [
   ['set_mode', 'handle: you answer routine questions and permissions yourself and ask the person when unsure or risky (pushing, deleting, deploying, anything leaving the machine). babysit: every ask goes to the person.', { session: S, mode: { ...S, enum: ['handle', 'babysit'] } }, ['session', 'mode'], 'set_mode'],
   ['list_asks', 'Open questions and permission requests from taken-over sessions on this machine, each with how many minutes it has waited.', { session: S, olderThan: { type: 'number', description: 'Only asks waiting at least this many minutes.' } }, [], 'asks'],
   ['check_update', 'Whether a newer Clawd release is out than the one installed on this machine, and the command that updates it.', {}, [], 'check_update'],
-  ['answer', 'Answer an open ask. A permission takes decision allow or deny (and a reason the session will read). A question takes pick (the option label, for one question) or answers (an object from question text to answer).', { ask: S, decision: { ...S, enum: ['allow', 'deny'] }, reason: S, pick: S, answers: { type: 'object' } }, ['ask'], 'answer'],
-  ['send_message', 'Send a message to a taken-over session, as if the person typed it. It runs when the session is next idle.', { session: S, text: S }, ['session', 'text'], 'send'],
+  ['answer', 'Answer an open ask. A permission takes decision allow or deny (and a reason the session will read); remember true with allow allows that exact command, or that tool, for the rest of the session. A plan (tool ExitPlanMode) is approved with allow, or sent back with deny and the changes wanted as reason. A question takes pick (the option label, for one question) or answers (an object from question text to answer).', { ask: S, decision: { ...S, enum: ['allow', 'deny'] }, reason: S, remember: { type: 'boolean' }, pick: S, answers: { type: 'object' } }, ['ask'], 'answer'],
+  ['send_message', 'Send a message to a taken-over session, as if the person typed it. It runs when the session is next idle. file attaches a file put with put_file.', { session: S, text: S, file: S }, ['session', 'text'], 'send'],
+  ['put_file', 'Put a file from the chat onto this machine (an https link, up to 20 MB), to attach with send_message.', { name: S, url: S }, ['name', 'url'], 'put'],
   ['interrupt', 'Stop what a taken-over session is doing right now (like pressing Esc).', { session: S }, ['session'], 'interrupt'],
   ['set_model', 'Change the model of a taken-over session from its next request on, while you have it. "default" goes back to its own.', { session: S, model: S }, ['session', 'model'], 'set_model'],
   ['set_effort', 'Change the reasoning effort (low, medium, high, xhigh, max) of a taken-over session from its next request on, while you have it. "default" goes back to its own.', { session: S, effort: S }, ['session', 'effort'], 'set_effort'],
@@ -798,7 +844,7 @@ const TOOLS = [
   ['set_ask_grok', 'Let a session ask you for help (its AskGrok tool), or stop it. The person must want it on.', { session: S, on: { ...S, enum: ['on', 'off'] }, perHour: { type: 'number' } }, ['session', 'on'], 'set_grok'],
   ['list_requests', 'Open AskGrok requests from sessions on this machine.', {}, [], 'requests'],
   ['reply_request', 'Answer a session\'s AskGrok request with text, or decline it with a reason.', { request: S, text: S, decline: S }, ['request'], 'reply'],
-  ['schedule_task', 'Start a background session later: at is "21:30", "+90m", "+2h" or an ISO date and time.', { at: S, folder: S, prompt: S, name: S, model: S, effort: S, mode: { ...S, enum: ['handle', 'babysit'] } }, ['at', 'folder', 'prompt'], 'schedule'],
+  ['schedule_task', 'Start a background session later, or with session send a taken-over session a message later (to retry after a usage limit resets): at is "21:30", "+90m", "+2h" or an ISO date and time.', { at: S, session: S, folder: S, prompt: S, name: S, model: S, effort: S, mode: { ...S, enum: ['handle', 'babysit'] } }, ['at', 'prompt'], 'schedule'],
   ['list_schedules', 'Scheduled tasks on this machine.', {}, [], 'schedules'],
   ['unschedule', 'Cancel a scheduled task.', { id: S }, ['id'], 'unschedule'],
 ].map(([name, description, properties, required, command]) => ({ name, description, inputSchema: { type: 'object', properties, required }, command }));
@@ -953,7 +999,9 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl remote <session> | budget <session> <usd|off> | ci-wake <session> on|off | file <path>
   clawdctl grok <session> on|off [--per-hour n] | requests | reply <request> --text <t> | --decline <why>
   clawdctl schedule --at <21:30|+90m|ISO> --folder <dir> --prompt <text> [--name n] [--model m] [--effort e] [--mode m]
-  clawdctl schedules | unschedule <id>
+  clawdctl schedules | unschedule <id> | schedule --at <time> --session <s> --prompt <text> (message a session later)
+  clawdctl put <name> --url <https link> | --base64-stdin   then send <session> <text> --file <path>
+  clawdctl answer <ask> --decision allow --remember      (allow this command, or this tool, for the rest of the session)
   clawdctl config webhook (asks for the two lines) | config webhook --test | config webhook --off | config machine <name> | config show
   clawdctl link           put clawdctl on your PATH (~/.local/bin); it runs the installed version
   clawdctl mcp            MCP over stdio (for a local agent, or ssh host clawdctl mcp)
@@ -970,11 +1018,12 @@ async function main() {
       case 'asks': return commands.asks(flags);
       case 'check-update': return commands.check_update();
       case 'start': return commands.start({ ...flags, prompt: flags.prompt ?? pos.join(' ') });
-      case 'take-over': return commands.take_over({ session: pos[0], mode: flags.mode });
+      case 'take-over': return await commands.take_over({ session: pos[0], mode: flags.mode });
       case 'release': return commands.release({ session: pos[0] });
       case 'mode': return commands.set_mode({ session: pos[0], mode: pos[1] });
       case 'answer': return commands.answer({ ask: pos[0], ...flags });
-      case 'send': return commands.send({ session: pos[0], text: pos.slice(1).join(' ') });
+      case 'send': return commands.send({ session: pos[0], text: pos.slice(1).join(' ') || undefined, file: flags.file });
+      case 'put': return commands.put({ name: pos[0] ?? flags.name, url: flags.url, base64Stdin: flags.base64Stdin });
       case 'interrupt': return commands.interrupt({ session: pos[0] });
       case 'model': return commands.set_model({ session: pos[0], model: pos[1] });
       case 'effort': return commands.set_effort({ session: pos[0], effort: pos[1] });

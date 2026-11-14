@@ -20,9 +20,15 @@ The ask may already be gone: answered at the computer, or the session was releas
 - Send: one question: `answer <askId> --pick '<exact label>'`. Several: once all are picked, `answer <askId> --answers '{"<question text>": "<label>", ...}'`. For multiple choice join the labels with `, `. A typed answer goes in as the value.
 
 ## Permissions
-- Show: tool, `summary` (the command or file), `reason` if any, and that a subagent asks when `subagent` is set. Two choices: Allow, Deny.
+- Show: tool, `summary` (the command or file), `reason` if any, and that a subagent asks when `subagent` is set. Choices: Allow, Allow for this session, Deny.
 - handle-it: allow it yourself only when clawd-rules allows; otherwise ask as above.
-- Send: `answer <askId> --decision allow` or `--decision deny --reason '<what to do instead>'`. Only after the user's yes for this exact ask, or your own handle-it call.
+- Send: `answer <askId> --decision allow`, add `--remember` for Allow for this session (that exact command, or that tool, stops asking until the session is handed back), or `--decision deny --reason '<what to do instead>'`. Only after the user's pick for this exact ask, or your own handle-it call.
+
+## Plans
+A permission with tool `ExitPlanMode` is a plan waiting for approval, and `summary` is the whole plan. Always the user's call, in both modes. Show its gist in three to six lines (offer the full text), then a card: Approve, Revise, Reject.
+- Approve: `answer <askId> --decision allow`.
+- Revise: ask what to change, then `answer <askId> --decision deny --reason '<their changes>'`; the session revises the plan and asks again.
+- Reject: `answer <askId> --decision deny --reason 'Not this plan. Stop and wait for instructions.'`.
 
 ## Decisions in a reply
 A finished turn often ends by putting a decision to the user without a formal ask: a proposal, "should I…", "want me to…", "ship it?", a choice between options. A `turn_done` event from the Claude desktop app may carry it in `decision` {`question`, `options`}.

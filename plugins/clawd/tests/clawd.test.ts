@@ -291,6 +291,51 @@ test('at its budget a taken-over session ends the turn before the next request',
   expect(budget.level).toBe('stopped')
 })
 
+test('allowed for the session, the same command is not held again; another one is', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  let held = 0
+  engine(on, files, () => {
+    held++
+    return { exitCode: 0, stdout: '{"decision":"allow","remember":true}' }
+  })
+  on('tool.check', () => ({ decision: 'ask' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  const a = await $.tool.check({ tool: 'Bash', input: { command: 'npm test' } })
+  const b = await $.tool.check({ tool: 'Bash', input: { command: 'npm test' } })
+  const c = await $.tool.check({ tool: 'Bash', input: { command: 'npm run build' } })
+
+  expect([a.decision, b.decision, c.decision]).toEqual(['allow', 'allow', 'allow'])
+  expect(held).toBe(2)
+})
+
+test('a plan for approval reaches the bot whole', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, () => ({ exitCode: 0, stdout: '{"decision":"allow"}' }))
+  on('tool.check', () => ({ decision: 'ask' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  const plan = `# Plan\n${'- step\n'.repeat(200)}`
+
+  await $.tool.check({ tool: 'ExitPlanMode', input: { plan } })
+
+  const ask = (outbox(files) as unknown as { kind: string; summary?: string }[]).find(e => e.kind === 'ask')!
+  expect(ask.summary).toBe(plan)
+})
+
+test('a session near the end of its context says so once', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, noWait)
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { percent: 86 } as never, rateLimits: [] } }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  await $.turn.complete({ turnId: 't1', answer: 'a', durationMs: 5, isAborted: false, reason: 'answer' })
+  await $.turn.complete({ turnId: 't2', answer: 'b', durationMs: 5, isAborted: false, reason: 'answer' })
+
+  const kinds = outbox(files).map(e => e.kind)
+  expect(kinds.filter(k => k === 'context').length).toBe(1)
+})
+
 test('an idle session pushes nothing when a turn fails', async ($, on) => {
   const files = new Map<string, string>()
   engine(on, files, noWait)

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0
+
+- A plan waiting for approval reaches the bot whole. The bot approves it, or sends it back with the changes wanted.
+- The bot can allow a permission for the rest of the session (`answer --remember`): that exact command, or that tool. Handing the session back forgets it.
+- A file from the chat can go into a session: `clawdctl put` saves it on the computer and `send --file` points the session at it.
+- `schedule --session` sends a taken-over session a message later, so a turn stopped by a usage limit can carry on when the limit resets.
+- A `context` event warns once when a session has used 80% of its context, and each finished turn carries `contextPercent`.
+- `take-over` says when a session hasn't picked it up, which means it was opened before Clawd was installed or updated and needs a restart.
+- `sessions` shows how long a taken-over session has been working (`workingMin`) or idle (`idleMin`).
+- The Grok skills teach the bot how to report: outcome first and short, a choice card whenever the person must decide, replies routed to the right session, a hand-back card when a task is done, and failure, plan and permission cards. The events routine prompt is now v4 and the waiting check v2. The Grok template no longer mentions Tailscale.
+
 ## 0.5.1
 
 - The spending cap is off unless the person turns it on for a session. The Grok skills never set, suggest or raise one on their own. Cost per session is still shown.
