@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.4
+
+- `clawdctl serve` listens on localhost unless `--host` names one private address, and refuses to listen on every interface. It no longer looks for a Tailscale address.
+
 ## 0.6.3
 
 - Plans go to the bot as replies. A plan dialog answers only at the session itself or through Remote Control, never to a hook, so the bot's approval left sessions stuck at it. A session the bot holds now refuses plan mode and writes its plan as its reply, and the bot approves, revises or rejects it with a message.

@@ -911,13 +911,11 @@ function serveKey() {
   return fs.readFileSync(file, 'utf8').trim();
 }
 
-function tailnetAddress() {
-  try { return execFileSync('tailscale', ['ip', '-4'], { encoding: 'utf8', timeout: 5000 }).split('\n')[0].trim() || undefined; } catch { return undefined; }
-}
-
 function serve({ host, port }) {
   const key = Buffer.from(serveKey());
-  const bind = host || tailnetAddress() || refuse('No tailnet address found. Pass --host to choose where to listen.');
+  // localhost unless told otherwise: --host is for a private address another machine reaches (a VPN or LAN), never 0.0.0.0
+  const bind = host || '127.0.0.1';
+  if (bind === '0.0.0.0' || bind === '::') refuse('Listen on one private address with --host, not on every interface.');
   const p = Number(port) || 7477;
   const server = http.createServer(async (req, res) => {
     const given = Buffer.from(/^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? '')?.[1] ?? '');
@@ -1018,7 +1016,7 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl config webhook (asks for the two lines) | config webhook --test | config webhook --off | config machine <name> | config show
   clawdctl link           put clawdctl on your PATH (~/.local/bin); it runs the installed version
   clawdctl mcp            MCP over stdio (for a local agent, or ssh host clawdctl mcp)
-  clawdctl serve [--host ip] [--port 7477]   MCP over HTTP on your tailnet, key in ~/.clawd/serve.key`;
+  clawdctl serve [--host ip] [--port 7477]   MCP over HTTP, localhost unless --host, key in ~/.clawd/serve.key`;
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);

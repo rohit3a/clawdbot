@@ -339,9 +339,9 @@ test('AskGrok: opt-in per session, a reply reaches a waiting request, a late one
   assert.equal((await clawdctl(['requests'])).json.requests.length, 2);
   assert.equal((await clawdctl(['reply', 'request-a', '--text', '3 payments, 4,200 INR'])).json.delivered, 'as the tool result');
   assert.deepEqual(read('answers', 'request-a.json'), { result: '3 payments, 4,200 INR' });
-  assert.equal((await clawdctl(['reply', 'request-b', '--decline', 'Posting needs Rohit'])).json.delivered, 'as a message');
+  assert.equal((await clawdctl(['reply', 'request-b', '--decline', 'Posting needs the person'])).json.delivered, 'as a message');
   const [msg] = fs.readdirSync(path.join(dir, 'inbox', SESSION));
-  assert.match(read('inbox', SESSION, msg).text, /declined your earlier AskGrok request .*Posting needs Rohit/);
+  assert.match(read('inbox', SESSION, msg).text, /declined your earlier AskGrok request .*Posting needs the person/);
   assert.equal((await clawdctl(['reply', 'request-b', '--text', 'again'])).code, 1);
 });
 
