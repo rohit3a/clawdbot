@@ -9,7 +9,7 @@ const CONTROL = `${HOME}/.clawd/control/${SESSION}.json`
 type Wait = (script: string) => { exitCode: number; stdout?: string }
 
 // The engine beneath the mod: an in-memory disk, a session, and the shell calls the mod makes.
-function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string[] = ['terminal'], logs: string[] = []) {
+function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string[] = ['terminal'], logs: string[] = [], ran: string[][] = []) {
   const run = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   on('session.id', () => ({ value: SESSION }))
   on('session.cwd', () => ({ value: CWD }))
@@ -34,10 +34,11 @@ function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string
     value: [...files.keys()].filter(f => f.startsWith(`${e.path}/`) && !f.slice(e.path.length + 1).includes('/')).map(f => ({ name: f.slice(e.path.length + 1), kind: 'file' as const, size: 0, mtimeMs: 0, isLink: false })),
   }))
   on('process.run', (_, e) => {
+    ran.push([...e.argv])
     const [cmd, ...args] = e.argv
     if (cmd === 'sh' && args[1]?.includes('"$HOME" "$PPID"')) return run(0, `${HOME}\n4242`)
     if (cmd === 'sh' && /seq \d+/.test(args[1] ?? '')) {
-      const r = wait(args[1])
+      const r = wait(args[1] ?? '')
       return run(r.exitCode, r.stdout ?? '')
     }
     if (cmd === 'rm') {
@@ -388,4 +389,79 @@ test('AskGrok is offered only when the person opts in, and returns the bot answe
   const r = await $.tool.call({ tool: 'AskGrok', task: 'Check Razorpay payments today' } as never)
   expect(JSON.stringify(r)).toContain('3 payments today')
   expect(outbox(files).map(e => e.kind)).toContain('request')
+})
+
+const STATUS = `${HOME}/.claude/sessions/4242.json`
+const atDialog = JSON.stringify({ status: 'waiting', waitingFor: 'dialog open' })
+const dialogChecks = (ran: string[][]) => ran.filter(a => a.includes('dialog-check'))
+const typed = (command: string, args = '') => ({ command, args, origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 100 } })
+
+test('a dialog left open in a held session is read once it has drawn, once per opening, with the command that opened it', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()], [STATUS, atDialog]])
+  const ran: string[][] = []
+  engine(on, files, noWait, ['terminal'], [], ran)
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000, percent: 12 }, rateLimits: [{ kind: 'seven_day', percentUsed: 16, resetsAt: '2026-11-20T20:00:00.000Z' }], cost: { usd: 0.42 } } }))
+  on('command.run', () => ({ text: undefined }))
+  let now = 1_000_000
+  on('clock.now', () => ({ value: now }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  const tick = () => $.command.run(typed('clawd', 'handle'))
+
+  await tick()
+  await $.command.run(typed('usage'))
+  await tick()
+  expect(dialogChecks(ran)).toEqual([])
+
+  now += 3100
+  await tick()
+  await tick()
+  expect(dialogChecks(ran).length).toBe(1)
+  expect(dialogChecks(ran)[0]).toEqual(expect.arrayContaining(['--session', SESSION, '--command', 'usage']))
+
+  const account = JSON.parse(files.get(`${HOME}/.clawd/screen/${SESSION}.json`)!) as { command: string; text: string }
+  expect(account.command).toBe('usage')
+  expect(account.text).toContain('Model: sonnet')
+  expect(account.text).toContain('Current week (all models): 16% used')
+  expect(account.text).toContain('Total cost: $0.42')
+
+  // closed, then opened again: the new opening is read too
+  files.set(STATUS, JSON.stringify({ status: 'idle' }))
+  await tick()
+  now += 60_000
+  files.set(STATUS, atDialog)
+  await tick()
+  now += 3100
+  await tick()
+  expect(dialogChecks(ran).length).toBe(2)
+  expect(dialogChecks(ran)[1]).not.toContain('--command')
+})
+
+test('an idle session neither reads its dialogs nor keeps an account of its commands', async ($, on) => {
+  const files = new Map([[STATUS, atDialog]])
+  const ran: string[][] = []
+  engine(on, files, noWait, ['terminal'], [], ran)
+  on('command.run', () => ({ text: undefined }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  await $.command.run(typed('usage'))
+  await $.command.run(typed('clawd', 'status'))
+
+  expect(dialogChecks(ran)).toEqual([])
+  expect([...files.keys()].some(f => f.includes('/.clawd/screen/'))).toBe(false)
+})
+
+test('every session keeps the newest plan limits for clawdctl usage', async ($, on) => {
+  const files = new Map<string, string>()
+  engine(on, files, noWait)
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  await $.session.measure({ context: { window: 200000 }, rateLimits: [], changed: ['context'] })
+  expect(files.has(`${HOME}/.clawd/usage.json`)).toBe(false)
+
+  const rateLimits = [{ kind: 'five_hour', percentUsed: 23.5, resetsAt: '2026-11-15T15:00:00.000Z' }, { kind: 'seven_day', percentUsed: 16 }]
+  await $.session.measure({ context: { window: 200000 }, rateLimits, changed: ['rateLimits'] })
+  const kept = JSON.parse(files.get(`${HOME}/.clawd/usage.json`)!) as { sessionId: string; rateLimits: unknown[] }
+  expect(kept.sessionId).toBe(SESSION)
+  expect(kept.rateLimits).toEqual(rateLimits)
 })

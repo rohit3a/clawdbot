@@ -9,8 +9,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { panelOf, render, usageLimits } from './screen.mjs';
 
-const VERSION = '0.6.4';
+const VERSION = '0.7.0';
 const HOME = os.homedir();
 const DIR = process.env.CLAWD_HOME || path.join(HOME, '.clawd');
 const PUSH_GAP_MS = 20_000;
@@ -31,7 +32,7 @@ const refuse = (message) => { throw new Refusal(message); };
 
 const sub = (...p) => path.join(DIR, ...p);
 function ensureDirs() {
-  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci', 'files']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
+  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci', 'files', 'screen']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
 }
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; }
@@ -180,7 +181,7 @@ const commands = {
     const wait = Number(process.env.CLAWD_TAKEOVER_WAIT_MS ?? 8_000);
     for (const end = Date.now() + wait; Date.now() < end && !fs.existsSync(live); ) await new Promise((r) => setTimeout(r, 250));
     if (!fs.existsSync(live)) return { session: a.sessionId, name: a.name, takenOver: true, pickedUp: false, note: 'The session has not picked this up. It was probably opened before Clawd was installed or updated: restart it (claude --resume ' + a.sessionId + ') and it will be yours.' };
-    return { session: a.sessionId, name: a.name, takenOver: true, pickedUp: true, note: 'Questions and permissions now come to you.' };
+    return { session: a.sessionId, name: a.name, takenOver: true, pickedUp: true, ...dialogShot(a), note: 'Questions and permissions now come to you.' };
   },
 
   release({ session }) {
@@ -314,7 +315,39 @@ const commands = {
     const n = Math.min(50, Math.max(1, Number(count) || 8));
     const file = transcriptOf(a.sessionId);
     const messages = file ? lastMessages(file, n) : [];
-    return { ...describe(a, openAsks()), messages };
+    return { ...describe(a, openAsks()), ...dialogShot(a), messages };
+  },
+
+  // --- what the session's terminal shows: an open panel (/usage, /cost, /status, a picker), read for the bot ---
+  async screen({ session, dismiss, full }) {
+    const a = resolve(session);
+    const open = atDialog(a);
+    const shot = screenOf(a, { full: !!full });
+    const out = { session: a.sessionId, name: a.name ?? null, status: describe(a, openAsks()).status, dialogOpen: open, ...shotFields(shot) };
+    if (dismiss) Object.assign(out, await dismissDialog(a, open, shot));
+    return out;
+  },
+
+  // the mod asks for this once a dialog has sat open a moment; it goes to the bot as a dialog event
+  async dialog_check({ session, command }) {
+    if (config().screen === false) return { dialogOpen: undefined, note: 'Screen capture is off.' };
+    const a = agents(true).find((x) => x.sessionId === session);
+    if (!a || !atDialog(a)) return { dialogOpen: false };
+    const shot = screenOf(a);
+    const f = shotFields(shot);
+    queueEvent({ kind: 'dialog', sessionId: a.sessionId, cwd: a.cwd, command: command ?? shot.command, screen: f.text, source: f.source, capturedAt: f.capturedAt, ...(f.truncated && { truncated: true }), ...(f.note && { note: f.note }) });
+    await commands.flush({ quiet: true });
+    return { dialogOpen: true, queued: true };
+  },
+
+  // the plan limits /usage shows: a reading a session on this machine took from its last API response, else a
+  // throwaway background session that opens /usage, is read and is removed, with no model request
+  async usage({ fresh, folder }) {
+    const newest = [readJson(sub('usage-panel.json')), sessionReading()].filter((u) => u?.limits?.length).sort((x, y) => y.at - x.at)[0];
+    if (!fresh && newest && Date.now() - newest.at < USAGE_FRESH_MS) return usageOut(newest);
+    const reading = await usageFromPanel(folder);
+    writeJson(sub('usage-panel.json'), reading);
+    return usageOut(reading);
   },
 
   // --- AskGrok: a session's request to the bot, and the bot's reply ---
@@ -483,6 +516,221 @@ const commands = {
     }
   },
 };
+
+// ---------- the session's screen ----------
+//
+// Only the session's own terminal is read: a background session's output log, or the terminal that holds the
+// session process's own tty, and only while the session is in front there. Nothing else on the computer is.
+
+const SCREEN_CHARS = 8000;
+const USAGE_FRESH_MS = 5 * 60_000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const atDialog = (a) => a.status === 'waiting' && a.waitingFor === 'dialog open';
+const quiet = (cmd, args, opts = {}) => execFileSync(cmd, args, { encoding: 'utf8', timeout: 10_000, maxBuffer: 16 << 20, stdio: ['ignore', 'pipe', 'ignore'], ...opts });
+
+// the tty a session process has, and whether it is in front there (ps marks the foreground process group with +)
+function ttyOf(pid) {
+  if (!Number.isInteger(pid)) return undefined;
+  try {
+    const [tty, stat = ''] = quiet('ps', ['-o', 'tty=,stat=', '-p', String(pid)]).trim().split(/\s+/);
+    if (!tty || /^\?+$/.test(tty)) return undefined;
+    return { tty: tty.startsWith('/dev/') ? tty : `/dev/${tty}`, foreground: stat.includes('+') };
+  } catch {
+    return undefined;
+  }
+}
+
+function sizeOf(tty) {
+  try {
+    const [rows, cols] = quiet('stty', [process.platform === 'darwin' ? '-f' : '-F', tty, 'size']).trim().split(/\s+/).map(Number);
+    if (rows > 0 && cols > 0) return { rows, cols };
+  } catch {}
+  return { rows: 50, cols: 200 };
+}
+
+// a tmux server the session runs under: its own TMUX socket when the process's environment can be read, else the default
+function tmuxPane(tty, pid) {
+  let socket;
+  try { socket = /(?:^|\0)TMUX=([^,\0]+)/.exec(fs.readFileSync(`/proc/${pid}/environ`, 'utf8'))?.[1]; } catch {}
+  const tmux = (...args) => quiet('tmux', [...(socket ? ['-S', socket] : []), ...args]);
+  try {
+    const id = tmux('list-panes', '-a', '-F', '#{pane_tty} #{pane_id}').split('\n').map((l) => l.trim().split(' ')).find(([t]) => t === tty)?.[1];
+    if (!id) return undefined;
+    return { via: 'tmux', lines: tmux('capture-pane', '-p', '-t', id).split('\n'), escape: () => tmux('send-keys', '-t', id, 'Escape') };
+  } catch {
+    return undefined;
+  }
+}
+
+function weztermPane(tty) {
+  try {
+    const pane = JSON.parse(quiet('wezterm', ['cli', 'list', '--format', 'json'])).find((p) => p.tty_name === tty);
+    if (!pane) return undefined;
+    const id = String(pane.pane_id);
+    return { via: 'wezterm', lines: quiet('wezterm', ['cli', 'get-text', '--pane-id', id]).split('\n'), escape: () => quiet('wezterm', ['cli', 'send-text', '--no-paste', '--pane-id', id, '\x1b']) };
+  } catch {
+    return undefined;
+  }
+}
+
+// iTerm2 and Terminal on a Mac, asked only when already running, about the one tab that holds the session's tty
+const MAC_TERMINALS = {
+  iTerm2: `function run([tty, act]) {
+  const app = Application('iTerm2');
+  if (!app.running()) return '\\u0000';
+  for (const w of app.windows()) for (const t of w.tabs()) for (const s of t.sessions()) {
+    if (s.tty() !== tty) continue;
+    if (act === 'escape') { s.write({ text: '\\u001b', newline: false }); return 'sent'; }
+    return s.contents();
+  }
+  return '\\u0000';
+}`,
+  Terminal: `function run([tty, act]) {
+  const app = Application('Terminal');
+  if (!app.running()) return '\\u0000';
+  for (const w of app.windows()) for (const t of w.tabs()) if (t.tty() === tty) return act === 'escape' ? '\\u0000' : t.contents();
+  return '\\u0000';
+}`,
+};
+function macTab(tty) {
+  if (process.platform !== 'darwin') return undefined;
+  for (const [app, script] of Object.entries(MAC_TERMINALS)) {
+    const ask = (act) => quiet('osascript', ['-l', 'JavaScript', '-e', script, tty, act], { timeout: 15_000 }).replace(/\n$/, '');
+    let text;
+    try { text = ask('read'); } catch { continue; }
+    if (text.startsWith('\u0000')) continue;
+    return { via: app === 'iTerm2' ? 'iterm2' : 'terminal', lines: text.split('\n'), ...(app === 'iTerm2' && { escape: () => ask('escape') }) };
+  }
+  return undefined;
+}
+
+// a background session's own output, replayed at its terminal's size
+function logsShot(a) {
+  let raw;
+  try { raw = quiet(CLAUDE, ['logs', a.id], { timeout: 15_000 }); } catch { return undefined; }
+  const t = ttyOf(a.pid);
+  return { via: 'logs', lines: render(raw, t ? sizeOf(t.tty) : undefined), escape: () => attachEscape(a) };
+}
+
+function terminalShot(a) {
+  if (a.kind === 'background' && a.id) return logsShot(a) ?? { none: 'The session\'s output could not be read (claude logs failed).' };
+  const t = ttyOf(a.pid);
+  if (!t) return { none: 'This session has no terminal of its own (it runs in the desktop app or an SDK host).' };
+  if (!t.foreground) return { none: `Something else is in front of the session in ${t.tty}, so it was not read.` };
+  return tmuxPane(t.tty, a.pid) ?? weztermPane(t.tty) ?? macTab(t.tty) ?? { none: `${t.tty} is in a terminal clawdctl cannot read. Run the session inside tmux (or WezTerm, or iTerm2 or Terminal on a Mac) for its screen to be read.` };
+}
+
+// what the session shows: its open panel (or the whole screen), else the mod's own account of the session when the
+// terminal cannot be read
+function screenOf(a, { full = false } = {}) {
+  const shot = terminalShot(a);
+  if (shot.lines) return { source: shot.via, text: full ? shot.lines.join('\n').replace(/\s+$/, '') : panelOf(shot.lines), capturedAt: new Date().toISOString(), escape: shot.escape };
+  const rec = controlOf(a.sessionId) ? readJson(sub('screen', `${a.sessionId}.json`)) : undefined;
+  if (rec?.text) return { source: 'session', command: rec.command, text: rec.text, capturedAt: new Date(rec.at).toISOString(), note: `${shot.none} This is the session's own account (model, context, cost, plan limits) from when /${rec.command} opened, not its screen.` };
+  return { source: null, text: null, capturedAt: new Date().toISOString(), note: shot.none };
+}
+
+function shotFields(shot) {
+  const cut = typeof shot.text === 'string' && shot.text.length > SCREEN_CHARS;
+  return { source: shot.source, text: cut ? `${shot.text.slice(0, SCREEN_CHARS)}…` : shot.text, capturedAt: shot.capturedAt, ...(shot.command && { command: shot.command }), ...(cut && { truncated: true }), ...(shot.note && { note: shot.note }) };
+}
+
+// for peek and take-over: the panel a session is stuck at, unless screen capture is off
+function dialogShot(a) {
+  if (!atDialog(a) || config().screen === false) return {};
+  const { escape: _e, ...shot } = screenOf(a);
+  return { screen: shotFields(shot) };
+}
+
+async function dismissDialog(a, open, shot) {
+  if (!open) return { dismissed: false, dismissNote: 'No dialog is open, so no Escape was sent: at work it would interrupt the turn.' };
+  if (!shot.escape) return { dismissed: false, dismissNote: 'Escape cannot be sent to this terminal from here. Release the session and close it at the computer, or use Remote Control.' };
+  try { await shot.escape(); } catch (e) { return { dismissed: false, dismissNote: `Escape could not be sent: ${e.message}` }; }
+  for (let i = 0; i < 10; i++) {
+    const now = agents(true).find((x) => x.sessionId === a.sessionId);
+    if (!now || !atDialog(now)) return { dismissed: true };
+    await sleep(400);
+  }
+  return { dismissed: false, dismissNote: 'Escape was sent, but the dialog is still open. It may need another Escape, or an answer.' };
+}
+
+// A background session takes keys only through claude attach, which wants a terminal: script gives it one at the
+// session's own size, Escape goes in once it has drawn, then Ctrl-D twice detaches. The session keeps running.
+async function attachEscape(a) {
+  const t = ttyOf(a.pid);
+  const { rows, cols } = t ? sizeOf(t.tty) : { rows: 50, cols: 200 };
+  const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const inner = `stty rows ${rows} cols ${cols} 2>/dev/null; exec ${shq(CLAUDE)} attach ${shq(a.id)}`;
+  const args = process.platform === 'darwin' ? ['-q', '/dev/null', 'sh', '-c', inner] : ['-qfec', inner, '/dev/null'];
+  const child = spawn('script', args, { stdio: ['pipe', 'pipe', 'ignore'] });
+  let drawn = 0;
+  let last = Date.now();
+  child.stdout.on('data', (b) => { drawn += b.length; last = Date.now(); });
+  const gone = new Promise((r) => child.on('close', r));
+  try {
+    for (const end = Date.now() + 8_000; Date.now() < end && !(drawn > 0 && Date.now() - last > 600); ) await sleep(100);
+    if (!drawn) throw new Error('claude attach drew nothing');
+    child.stdin.write('\x1b');
+    await sleep(1_200);
+    child.stdin.write('\x04');
+    await sleep(300);
+    child.stdin.write('\x04');
+    await Promise.race([gone, sleep(3_000)]);
+  } finally {
+    if (child.exitCode === null) child.kill('SIGTERM');
+  }
+}
+
+// ---------- plan usage ----------
+
+const LIMIT_KINDS = { five_hour: ['session', 'Current session'], seven_day: ['week', 'Current week (all models)'], spend_limit: ['spend', 'Spend limit'] };
+
+// what the mod in each session keeps from its last API response (`$.session.usage().rateLimits`)
+function sessionReading() {
+  const r = readJson(sub('usage.json'));
+  if (!r?.rateLimits?.length) return undefined;
+  const limits = r.rateLimits.map((l) => {
+    const [id, label] = LIMIT_KINDS[l.kind] ?? (/^seven_day_(\w+)$/.exec(l.kind) ? [`week:${l.kind.slice(10)}`, `Current week (${l.kind.slice(10)})`] : [l.kind, l.kind]);
+    return { id, label, percentUsed: l.percentUsed, ...(l.resetsAt && { resetsAt: l.resetsAt }) };
+  });
+  return { at: r.at, source: 'session', limits };
+}
+
+function usageOut(r) {
+  return { machine: machine(), source: r.source, readAt: new Date(r.at).toISOString(), limits: r.limits, ...(r.text && { text: r.text }), note: r.source === 'session' ? 'From the last API response of a session on this machine. --fresh reads the /usage panel instead.' : 'Read from the /usage panel of a throwaway session, which made no model request and was removed.' };
+}
+
+async function usageFromPanel(folder) {
+  const cwd = path.resolve(String(folder || config().usageFolder || HOME).replace(/^~(?=$|\/)/, HOME));
+  if (!fs.existsSync(cwd)) refuse(`No folder at ${cwd}.`);
+  let out;
+  try {
+    out = execFileSync(CLAUDE, ['--bg', '-n', 'clawd-usage', '/usage'], { cwd, encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    const why = `${e.stdout ?? ''}${e.stderr ?? ''}`.trim();
+    refuse(why.includes('not trusted') ? `${cwd} is not trusted, and the usage check starts a background session there. Open Claude there once and accept the trust prompt, or name a trusted folder: clawdctl config usage-folder <dir>.` : `Claude did not start: ${why.slice(0, 400)}`);
+  }
+  const shortId = /backgrounded\s*·\s*(\S+)/.exec(out)?.[1] ?? refuse(`Claude did not say which session it started: ${out.slice(0, 200)}`);
+  let seen;
+  try {
+    for (const end = Date.now() + 30_000; Date.now() < end; ) {
+      await sleep(700);
+      const a = agents(true).find((x) => x.id === shortId);
+      if (!a || !atDialog(a)) continue;
+      const shot = logsShot(a);
+      if (!shot) continue;
+      const text = panelOf(shot.lines);
+      const limits = usageLimits(text);
+      if (limits.length) seen = { at: Date.now(), source: 'usage-panel', limits, text };
+      // the panel draws at once and fills its limits in when they arrive
+      if (limits.length && !/Refreshing…|Loading/i.test(text)) break;
+    }
+  } finally {
+    try { quiet(CLAUDE, ['stop', shortId], { timeout: 30_000 }); } catch {}
+    try { quiet(CLAUDE, ['rm', shortId], { timeout: 30_000 }); } catch {}
+  }
+  return seen ?? refuse('The /usage panel showed no limits within 30 seconds. Is this computer signed in to a Claude plan?');
+}
 
 // a scheduled task: a message to a session the bot still has, or a new background session
 async function runTask(id, t) {
@@ -760,6 +1008,7 @@ function line(e) {
   if (e.kind === 'budget') return `${who} ${e.level === 'stopped' ? 'stopped at its budget' : 'is at 80% of its budget'}: $${e.costUsd} of $${e.budgetUsd}.`;
   if (e.kind === 'scheduled' && e.sent) return `${who} got its scheduled message (task ${e.taskId}).`;
   if (e.kind === 'scheduled') return e.failed ? `[${machine()}] Scheduled task ${e.taskId} did not start: ${e.failed}` : `[${machine()}] Scheduled task ${e.taskId} started ${e.started?.name ?? ''}${e.started?.remoteUrl ? `: ${e.started.remoteUrl}` : ''}`;
+  if (e.kind === 'dialog') return `${who} is stuck at a dialog${e.command ? ` (/${e.command})` : ''}${e.screen ? `${e.source === 'session' ? ' (its screen could not be read, so this is the session\'s own account)' : ''}: ${clip(e.screen.replace(/\s*\n\s*/g, ' · '), 600)}` : `, which could not be read${e.note ? ` (${e.note})` : ''}`}. clawdctl screen --dismiss closes it.`;
   if (e.kind === 'progress') return `${who} progress: ${e.busy ? 'working' : 'idle'}${e.holding ? `, waiting on ${e.holding}` : ''}. Last: ${clip(e.lastAnswer, 300)}`;
   return `${who} ${e.kind}`;
 }
@@ -849,6 +1098,8 @@ const TOOLS = [
   ['set_permissions', 'Set how a taken-over session handles permission prompts while you have it: acceptEdits allows file edits inside its folder without asking, dontAsk denies anything not pre-approved, default goes back to asking you.', { session: S, permissions: { ...S, enum: ['default', 'acceptEdits', 'dontAsk'] } }, ['session', 'permissions'], 'set_permissions'],
   ['set_report', 'Push a short progress report for a taken-over session every N minutes, or "off".', { session: S, minutes: S }, ['session', 'minutes'], 'set_report'],
   ['peek', 'The last messages of a session and its state, to summarise it for the person.', { session: S, count: { type: 'number' } }, ['session'], 'peek'],
+  ['read_screen', 'The dialog or panel a session shows in its terminal (/usage, /cost, /status, a model picker), as text: status "waiting: dialog open" means one is up. dismiss true sends Escape afterwards, only while a dialog is open. full true returns the whole screen.', { session: S, dismiss: { type: 'boolean' }, full: { type: 'boolean' } }, ['session'], 'screen'],
+  ['plan_usage', 'The Claude plan limits on this machine\'s account as /usage shows them: each window (session, week, a model\'s week) with percent used and when it resets. Uses a reading under 5 minutes old; fresh true reads /usage again (a throwaway session, no model request).', { fresh: { type: 'boolean' }, folder: S }, [], 'usage'],
   ['stop_session', 'Stop a background session. Its conversation is kept and can be resumed.', { session: S }, ['session'], 'stop'],
   ['remote_control', 'Turn on Remote Control for a taken-over terminal session; the link arrives as a remote event.', { session: S }, ['session'], 'remote'],
   ['set_budget', 'Off by default. Only when the person asks: cap what a taken-over session may spend, in US dollars, or "off". Warns at 80%; at 100% the turn stops before the next request.', { session: S, usd: S }, ['session', 'usd'], 'set_budget'],
@@ -1007,6 +1258,8 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
   clawdctl permissions <session> default|acceptEdits|dontAsk
   clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
+  clawdctl screen <session> [--dismiss] [--full]   the dialog or panel the session shows; --dismiss sends Escape after
+  clawdctl usage [--fresh] [--folder <dir>]        plan limits as /usage shows them (session, weekly, resets)
   clawdctl remote <session> | budget <session> <usd|off> | ci-wake <session> on|off | file <path>
   clawdctl grok <session> on|off [--per-hour n] | requests | reply <request> --text <t> | --decline <why>
   clawdctl schedule --at <21:30|+90m|ISO> --folder <dir> --prompt <text> [--name n] [--model m] [--effort e] [--mode m]
@@ -1014,6 +1267,7 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl put <name> --url <https link> | --base64-stdin   then send <session> <text> --file <path>
   clawdctl answer <ask> --decision allow --remember      (allow this command, or this tool, for the rest of the session)
   clawdctl config webhook (asks for the two lines) | config webhook --test | config webhook --off | config machine <name> | config show
+  clawdctl config screen on|off | config usage-folder <dir>
   clawdctl link           put clawdctl on your PATH (~/.local/bin); it runs the installed version
   clawdctl mcp            MCP over stdio (for a local agent, or ssh host clawdctl mcp)
   clawdctl serve [--host ip] [--port 7477]   MCP over HTTP, localhost unless --host, key in ~/.clawd/serve.key`;
@@ -1041,6 +1295,9 @@ async function main() {
       case 'permissions': return commands.set_permissions({ session: pos[0], permissions: pos[1] });
       case 'report': return commands.set_report({ session: pos[0], minutes: pos[1] });
       case 'peek': return commands.peek({ session: pos[0], count: flags.count });
+      case 'screen': return await commands.screen({ session: pos[0], dismiss: flags.dismiss, full: flags.full });
+      case 'usage': return await commands.usage({ fresh: flags.fresh, folder: flags.folder });
+      case 'dialog-check': return await commands.dialog_check(flags);
       case 'stop': return commands.stop({ session: pos[0] });
       case 'requests': return commands.requests();
       case 'reply': return commands.reply({ request: pos[0], text: flags.text ?? (pos.length > 1 ? pos.slice(1).join(' ') : undefined), decline: flags.decline });
@@ -1111,8 +1368,15 @@ async function configure(pos, flags) {
     const res = await post({ url, auth }, [{ id: `test-${Date.now().toString(36)}`, at: Date.now(), kind: 'test' }]).catch(() => undefined);
     return { saved: true, test: res?.ok ? 'OK' : `failed (${res?.status ?? 'no answer'}): paste both lines again` };
   }
+  if (pos[0] === 'screen' && (pos[1] === 'on' || pos[1] === 'off')) { writeJson(sub('config.json'), { ...c, screen: pos[1] === 'on' }); return { screen: pos[1] }; }
+  if (pos[0] === 'usage-folder' && pos[1]) {
+    const dir = path.resolve(pos[1].replace(/^~(?=$|\/)/, HOME));
+    if (!fs.existsSync(dir)) refuse(`No folder at ${dir}.`);
+    writeJson(sub('config.json'), { ...c, usageFolder: dir });
+    return { usageFolder: dir };
+  }
   if (pos[0] === 'machine') { writeJson(sub('config.json'), { ...c, machine: pos[1] }); return { machine: pos[1] }; }
-  return { machine: machine(), webhook: c.webhook?.url ? 'set' : null, key: c.webhook?.auth || c.webhook?.key ? 'set' : 'none' };
+  return { machine: machine(), webhook: c.webhook?.url ? 'set' : null, key: c.webhook?.auth || c.webhook?.key ? 'set' : 'none', screen: c.screen === false ? 'off' : 'on', usageFolder: c.usageFolder ?? HOME };
 }
 
 main();

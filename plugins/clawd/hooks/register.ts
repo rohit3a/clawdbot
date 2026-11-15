@@ -23,6 +23,9 @@ const FLUSH_BACKOFF_MAX_MS = 300_000
 const PLAN_BY_REPLY = 'Clawd Bot has this session, and plan mode can only be approved at the session itself. Do not enter plan mode: write your plan as your reply and stop there. The go-ahead, or the changes wanted, will come as a message.'
 const ANSWER_CHARS = 8000
 const GIST_CHARS = 1500
+// a panel fills in a moment after it opens (/usage fetches its limits), so it is read once it has sat open this long
+const DIALOG_SETTLE_MS = 3000
+const LIMIT_NAMES: Record<string, string> = { five_hour: 'Current session', seven_day: 'Current week (all models)', spend_limit: 'Spend limit' }
 
 let home: string | undefined
 let sessionId: string | undefined
@@ -59,6 +62,11 @@ let budgetSaid: { budget: number; level: 'warn' | 'stopped' } | undefined
 // permissions the bot allowed for the rest of the session: a Bash command exactly, any other tool by name
 const allowedForSession = new Set<string>()
 let contextSaid = false
+// Claude's config folder, where the session keeps its status file (sessions/<pid>.json)
+let configDir: string | undefined
+// a dialog open in this session, and whether clawdctl has read it for the bot yet
+let dialog: { since: number; read: boolean } | undefined
+let lastCommand: { command: string; at: number } | undefined
 
 const MEDIA = /\.(png|jpe?g|gif|webp|svg|mp4|mov|webm|pdf)$/i
 const URLS = /https?:\/\/[^\s<>"'`()[\]{}]+/g
@@ -91,9 +99,10 @@ let pid: number | undefined
 async function dir($: $): Promise<string> {
   if (!home) {
     // the shell's parent is this session's process; its pid lets clawdctl tell a live ask from one left by a dead session
-    const [h = '', p = ''] = (await $.process.run(['sh', '-c', 'printf "%s\\n%s" "$HOME" "$PPID"'])).stdout.split('\n')
+    const [h = '', p = '', c = ''] = (await $.process.run(['sh', '-c', 'printf "%s\\n%s\\n%s" "$HOME" "$PPID" "${CLAUDE_CONFIG_DIR:-}"'])).stdout.split('\n')
     home = h
     pid = Number(p) || undefined
+    configDir = c || `${h}/.claude`
   }
   return `${home}/.clawd`
 }
@@ -267,6 +276,39 @@ async function remoteOn($: $): Promise<void> {
   await emit($, 'remote', {})
 }
 
+// A dialog (/usage, /cost, /status, a model picker) holds the keys, and nobody at the bot can see it. The session's
+// status file says when one is open; once it has drawn, clawdctl reads it off this session's terminal and sends it
+// to the bot as a dialog event, once per opening.
+async function watchDialog($: $): Promise<void> {
+  if (!control || !pid) {
+    dialog = undefined
+    return
+  }
+  const state = await readJson<{ status?: string; waitingFor?: string }>($, `${configDir}/sessions/${pid}.json`)
+  if (state?.status !== 'waiting' || state.waitingFor !== 'dialog open') {
+    dialog = undefined
+    return
+  }
+  const now = await $.clock.now()
+  dialog ??= { since: now, read: false }
+  if (dialog.read || now - dialog.since < DIALOG_SETTLE_MS) return
+  dialog.read = true
+  const command = lastCommand && lastCommand.at >= dialog.since - 10_000 ? lastCommand.command : undefined
+  await clawdctl($, ['dialog-check', '--session', await myId($), ...(command ? ['--command', command] : [])])
+}
+
+// what the session itself knows, for a terminal clawdctl cannot read: its model, context, cost and plan limits
+async function sessionAccount($: $, command: string): Promise<string> {
+  const u = await $.session.usage().catch(() => undefined)
+  const model = await $.session.model().catch(() => undefined)
+  const lines = [`/${command} is open.`]
+  if (model) lines.push(`Model: ${model}`)
+  if (typeof u?.context?.percent === 'number') lines.push(`Context: ${Math.round(u.context.percent)}% used`)
+  if (u?.cost) lines.push(`Total cost: $${u.cost.usd.toFixed(2)}`)
+  for (const l of u?.rateLimits ?? []) lines.push(`${LIMIT_NAMES[l.kind] ?? l.kind}: ${l.percentUsed}% used${l.resetsAt ? `, resets ${l.resetsAt}` : ''}`)
+  return lines.join('\n')
+}
+
 async function applySteer($: $, s: Steer): Promise<void> {
   if (s.type === 'message') void $.prompt.submit({ text: s.text })
   else if (s.type === 'remote') wantRemote = true
@@ -325,6 +367,7 @@ async function tick($: $): Promise<void> {
       await emit($, 'progress', { busy, holding: holding ?? null, lastAnswer: gist.text, ...(gist.truncated && { truncated: true }), lastTurnAt })
     }
     await flush($, false)
+    await watchDialog($)
   } finally {
     ticking = false
   }
@@ -367,6 +410,27 @@ export const register: Register = on => {
       argumentHint: 'on | off | babysit | handle | status | grok on | grok off',
     })
     return next(e)
+  })
+
+  // a command the session runs while the bot has it: the panel it may open is named in the dialog event, and the
+  // session's own account of itself stands in for a screen clawdctl cannot read
+  on('command.run', async ($, e, next) => {
+    const mine = e.command === 'clawd' || (e.origin.kind === 'plugin' && e.origin.name === 'clawd')
+    if (control && !mine) {
+      lastCommand = { command: e.command, at: await $.clock.now() }
+      const text = await sessionAccount($, e.command)
+      await $.fs.write(`${await dir($)}/screen/${await myId($)}.json`, JSON.stringify({ command: e.command, at: Date.now(), text })).catch(() => undefined)
+    }
+    return next(e)
+  })
+
+  // plan limits are the account's: every session keeps the newest reading, for clawdctl usage
+  on('session.measure', async ($, e, next) => {
+    const r = await next(e)
+    if (e.changed.includes('rateLimits') && e.rateLimits.length) {
+      await $.fs.write(`${await dir($)}/usage.json`, JSON.stringify({ at: Date.now(), sessionId: await myId($), rateLimits: e.rateLimits })).catch(() => undefined)
+    }
+    return r
   })
 
   on('command.run', { command: 'clawd' }, async ($, e) => {

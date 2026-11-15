@@ -17,7 +17,9 @@ Everything runs on your machines and over links you already have. There is no se
 - Answer its questions and permission prompts.
 - Send it a message, interrupt it, and change its model, effort or permission mode (accept edits, or don't ask).
 - Read its last messages, and stop a background session.
-- Push events to the bot: asks, finished turns, interruptions and failures, plus a progress report at an interval you choose.
+- Read a dialog or panel left open on its screen (/usage, /cost, /status, a model picker), and close it with Escape.
+- Show the Claude plan's limits as /usage does: the current session and the week, how much of each is used and when each resets.
+- Push events to the bot: asks, finished turns, interruptions and failures, a session stuck at a dialog with the dialog's text, plus a progress report at an interval you choose.
 - With each finished turn, pass on what it made: links (PRs, previews), media files (images, GIFs, videos, PDFs) the bot can fetch and post, the turn's commits and changed files, the PR and its checks, and the session's cost.
 - Turn on Remote Control when it takes over a terminal session, and send the bot the link.
 - Watch a PR's checks after a turn. When CI fails, the bot hears about it and the session is woken to fix it.
@@ -123,15 +125,62 @@ clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --an
 clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
 clawdctl permissions <session> default|acceptEdits|dontAsk
 clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
+clawdctl screen <session> [--dismiss] [--full] | usage [--fresh] [--folder <dir>]
 clawdctl remote <session> | budget <session> <usd|off> | ci-wake <session> on|off | file <path>
 clawdctl grok <session> on|off [--per-hour n] | requests | reply <request> --text <t> | --decline <why>
 clawdctl schedule --at <21:30|+90m|ISO> --folder <dir> --prompt <text> [--name n] [--model m] [--effort e] [--mode m]
 clawdctl schedules | unschedule <id>
 clawdctl config webhook --url <url> [--key-stdin] | config webhook --off | config machine <name> | config show
+clawdctl config screen on|off | config usage-folder <dir>
 clawdctl link | mcp | serve [--host ip] [--port 7477]
 ```
 
 A session can be named by its id, the start of its id, its short background id or its name.
+
+### Dialogs on the screen
+
+A dialog such as /usage, /cost, /status or the model picker holds the keys, and nothing of it reaches the bot by itself. `sessions` shows such a session as `waiting: dialog open`.
+
+```bash
+clawdctl screen api-fix
+```
+
+```json
+{ "session": "…", "name": "api-fix", "status": "waiting: dialog open", "dialogOpen": true, "source": "logs",
+  "text": "Settings  Status  Config  Usage  Stats\n\nCurrent week (all models)\n████████  17% used\n…\nEsc to cancel",
+  "capturedAt": "2026-11-15T09:35:01.018Z" }
+```
+
+`text` is the open panel; `--full` gives the whole screen. `--dismiss` sends Escape afterwards, only while a dialog is open, since Escape during a turn would interrupt it, and says whether the dialog closed.
+
+Only the session's own terminal is read:
+
+| Session | Read from | Escape through |
+| --- | --- | --- |
+| Background | its own output, `claude logs`, replayed at its terminal's size | `claude attach`, in a terminal `script` gives it |
+| Interactive, in tmux or WezTerm | the pane that holds the session's tty | the same pane |
+| Interactive, in iTerm2 or Terminal on a Mac | the tab that holds the session's tty | iTerm2 only |
+| Anything else | the session's own account: model, context, cost and plan limits, when the bot has it | not offered |
+
+An interactive session is read only while it is in front in its terminal. On a Mac, the first read asks once for permission to control iTerm2 or Terminal. Panels show what the session's screen shows, including the account's email in /status.
+
+When a session the bot holds sits at a dialog for 3 seconds, a `dialog` event carries its text, once per opening. `peek` and `take-over` include it as `screen`. `clawdctl config screen off` stops these automatic reads; `clawdctl screen` still works.
+
+### Plan usage
+
+```bash
+clawdctl usage
+```
+
+```json
+{ "machine": "Laptop", "source": "usage-panel", "readAt": "2026-11-15T09:32:59.784Z",
+  "limits": [
+    { "id": "session", "label": "Current session", "percentUsed": 23, "resets": "3pm (Europe/London)", "resetsAt": "2026-11-15T15:00:00.000Z" },
+    { "id": "week", "label": "Current week (all models)", "percentUsed": 17, "resets": "Nov 21, 1:30am (Asia/Kolkata)", "resetsAt": "2026-11-20T20:00:00.000Z" }
+  ] }
+```
+
+A reading under 5 minutes old is used as it is: the last panel read, or the limits a session on the computer saw in its last API response (`source: "session"`). Otherwise, or with `--fresh`, clawdctl opens /usage in a throwaway background session in your home folder, reads it, and stops and removes the session, in about 10 seconds. That sends no prompt to the model, so it uses none of the plan. The folder must be trusted: `--folder <dir>` or `clawdctl config usage-folder <dir>` names another one.
 
 ## How it works
 
@@ -141,13 +190,16 @@ The mod and clawdctl share files in `~/.clawd`:
 - `asks/` holds open questions and permission prompts; `answers/` holds the bot's answers.
 - `inbox/<session>/` holds messages and interrupts for the session.
 - `outbox/` holds events waiting to be pushed.
+- `screen/<session>.json` is a taken-over session's own account of itself at its last slash command, for a terminal clawdctl cannot read.
+- `usage.json` holds the plan limits from the newest API response of any session on the computer.
 
-An idle session reads only its own control file, every two seconds. A taken-over session holds each ask at the point Claude would show it, waits for an answer file, and lets go the moment the session is released. Model, effort and permission-mode changes apply while the bot has the session, at each request and each permission check, so no confirmation dialog opens on a screen nobody is watching and your own default mode is left alone. Sessions that `clawdctl start` launches take a claim for their folder in their first turn, so even their first prompt is covered.
+An idle session reads only its own control file, every two seconds, and writes `usage.json` when its plan limits move. A taken-over session holds each ask at the point Claude would show it, waits for an answer file, and lets go the moment the session is released. Model, effort and permission-mode changes apply while the bot has the session, at each request and each permission check, so no confirmation dialog opens on a screen nobody is watching and your own default mode is left alone. Sessions that `clawdctl start` launches take a claim for their folder in their first turn, so even their first prompt is covered.
 
 ## Limits
 
 - Tested on Linux and macOS. Windows is untested.
 - A held ask waits as long as it takes. Your bot decides when to give up and answer.
+- Screen capture reads background sessions, and interactive ones in tmux, WezTerm, iTerm2 or Terminal. Other terminals (GNOME Terminal, a plain SSH login) get the session's own account instead of its screen.
 - Model, effort and permission mode set by the bot last while it has the session. Released, the session goes back to its own. The bot can't set plan, auto or bypass mode.
 - Background sessions need a trusted folder.
 - PR and CI status need the `gh` CLI signed in on the computer.
