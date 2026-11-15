@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- `clawdctl screen <session>` reads the dialog or panel a session shows (/usage, /cost, /status, a model picker) and prints it as JSON: `session`, `status`, `text`, `capturedAt`, and `source`, where the text came from. `--dismiss` then sends Escape, only while a dialog is open, and says whether it closed. `--full` returns the whole screen.
+- Only the session's own terminal is read. A background session is read from its own output (`claude logs`), replayed by a small terminal emulator at its terminal's size, and takes Escape through `claude attach`. An interactive session is read from the tmux or WezTerm pane, or the iTerm2 or Terminal tab on a Mac, that holds its own tty, and only while the session is in front there. A terminal clawdctl cannot read gets the session's own account instead (model, context, cost, plan limits), marked `source: session`.
+- A taken-over session that sits at a dialog sends a `dialog` event with the panel's text, once per opening, after it has had 3 seconds to draw. `peek` and `take-over` carry the text as `screen` while a session is at a dialog. On by default; `clawdctl config screen off` stops the automatic reads.
+- `clawdctl usage` prints the Claude plan limits as /usage shows them: each window (current session, current week, a model's week) with `percentUsed`, `resets` as shown and `resetsAt` in UTC. It uses a reading under 5 minutes old: from a session's last API response, which every session on the computer now keeps, or from the last panel read. Otherwise, or with `--fresh`, it opens /usage in a throwaway background session, reads it, and stops and removes the session. That makes no model request, so it uses none of the plan. The session starts in your home folder, which must be trusted; `--folder` or `clawdctl config usage-folder <dir>` names another.
+- MCP: `read_screen` and `plan_usage`.
+- The events routine prompt is now v6, with the `dialog` event.
+
 ## 0.6.4
 
 - `clawdctl serve` listens on localhost unless `--host` names one private address, and refuses to listen on every interface. It no longer looks for a Tailscale address.

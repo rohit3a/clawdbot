@@ -1,6 +1,6 @@
 {
   "name": "clawd",
-  "version": "0.6.4",
+  "version": "0.7.0",
   "description": "Idle until you or your bot take a session over; then every question and permission goes to the bot, which can also steer the session.",
   "author": {
     "name": "rohit3a",

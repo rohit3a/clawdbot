@@ -5,7 +5,8 @@ description: >-
   start one, take one over or hand it back, send a message, interrupt, change
   model, effort or mode, set progress reports, read what it said, stop it. Use
   for "what's running", "start Claude on…", "take over…", "tell it to…",
-  "switch to sonnet", "babysit it", "give it back", "what did it say".
+  "switch to sonnet", "babysit it", "give it back", "what did it say",
+  "what's on its screen", "close that dialog", "how much usage is left".
 ---
 Follow clawd-rules first.
 
@@ -47,6 +48,14 @@ Only when the user asks for it: `grok '<X>' on` lets that session ask you for he
 ## Watch
 - "What did it say / what is it doing": `peek '<X>' --count 6` and summarise its last messages in two or three lines. Each message holds up to 8,000 characters; one marked `truncated` is longer still. If its last reply puts a decision to the user, follow clawd-event, "Decisions in a reply".
 - Progress reports: `report '<X>' <minutes>` (or `off`). Each report arrives as an event.
+
+## A dialog on its screen
+A session whose status is `waiting: dialog open` sits at a panel such as /usage, /cost, /status or the model picker, which holds its keys. `peek` and `take-over` then carry its text as `screen`; a session you hold also sends a `dialog` event.
+- "What's on its screen": `screen '<X>'`. Sum up `text` in two or three lines. `source: session` means its terminal could not be read and the text is the session's own account (model, context, cost, plan limits), not its screen: say so. `text: null` comes with a `note` that says why.
+- "Close it": `screen '<X>' --dismiss`. It sends Escape only while a dialog is open, and `dismissed` says whether it closed. A picker or question that needs a choice may stay open: then it needs the user at the computer, or Remote Control.
+
+## Plan usage
+"How much usage is left", "when does my limit reset": `usage` on that computer. Report each of `limits` in one line: `label`, `percentUsed`, and `resetsAt` in the user's time zone. A reading under 5 minutes old is used as it is; `--fresh` reads /usage again in a throwaway session that makes no model request, about 10 seconds. A "not trusted" refusal names the fix: relay it. The limits are the account's, so one computer is enough.
 
 ## Stop
 `stop '<X>'` ends a background session; it can be resumed later with the `resume` command it prints. An interactive session can't be stopped from here: interrupt it and hand it back.

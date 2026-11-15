@@ -17,7 +17,9 @@ const OTHER = '11119999-0000-0000-0000-000000000000';
 let root, home, dir, hook;
 const received = [];
 
-// `claude agents --json` lists two sessions; `--version` and `stop` answer as Claude Code does
+// `claude agents --json` lists two sessions; `--version` and `stop` answer as Claude Code does. A test can give
+// its own session list ($HOME/fake/agents.json), a background session's output (fake/logs-<id>), what `--bg`
+// starts (fake/bg-agents.json), and what an attached session does with the keys it gets (fake/after-attach.json).
 function fakeClaude() {
   const agents = JSON.stringify([
     { sessionId: SESSION, id: 'bg01', kind: 'background', name: 'api-fix', cwd: '/w/api', status: 'busy' },
@@ -25,10 +27,20 @@ function fakeClaude() {
   ]);
   const bin = path.join(root, 'claude');
   fs.writeFileSync(bin, `#!/bin/sh
+F="$HOME/fake"
+mkdir -p "$F"
 case "$1" in
-  agents) printf '%s' '${agents}' ;;
+  agents) if [ -f "$F/agents.json" ]; then cat "$F/agents.json"; else printf '%s' '${agents}'; fi ;;
   --version) echo '9.9.9 (Claude Code)' ;;
-  stop) echo stopped >> "${root}/stopped" ;;
+  stop) echo stopped >> "${root}/stopped"; echo "stop $2" >> "$F/calls" ;;
+  rm) echo "rm $2" >> "$F/calls" ;;
+  logs) cat "$F/logs-$2" ;;
+  attach) printf 'Attaching...'; head -c 1 > "$F/attach-input"; [ -f "$F/after-attach.json" ] && cp "$F/after-attach.json" "$F/agents.json"; head -c 2 >> "$F/attach-input" ;;
+  --bg)
+    echo "bg $PWD $*" >> "$F/calls"
+    if [ -f "$F/untrusted" ]; then echo 'Error: this folder is not trusted' >&2; exit 1; fi
+    [ -f "$F/bg-agents.json" ] || exit 0
+    cp "$F/bg-agents.json" "$F/agents.json"; echo 'backgrounded · bg77 · clawd-usage' ;;
 esac
 `, { mode: 0o755 });
   return bin;
@@ -498,4 +510,215 @@ test('the shim runs the installed copy, and falls back when the recorded Node is
   }, (err, stdout, stderr) => resolve({ err, stdout, stderr })));
   assert.equal(r.err, null, r.stderr);
   assert.deepEqual(JSON.parse(r.stdout).installed, { version: '7.7.7', commit: 'feedface' });
+});
+
+// ---------- the session's screen, and plan usage ----------
+
+const fake = (...p) => path.join(home, 'fake', ...p);
+const putFake = (name, text) => { fs.mkdirSync(fake(), { recursive: true }); fs.writeFileSync(fake(name), text); };
+const readFake = (name) => { try { return fs.readFileSync(fake(name), 'utf8'); } catch { return ''; } };
+// a stand-in for a tool clawdctl runs (ps, stty, tmux, script), found first on its PATH
+const fakeTool = (name, body) => {
+  const bin = path.join(home, '.local', 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, name), `#!/bin/sh\nF="$HOME/fake"\n${body}\n`, { mode: 0o755 });
+};
+const sessionList = (...rows) => JSON.stringify(rows);
+const bgAt = (extra = {}) => ({ sessionId: SESSION, id: 'bg01', pid: 4242, kind: 'background', name: 'api-fix', cwd: '/w/api', status: 'waiting', waitingFor: 'dialog open', ...extra });
+const docsAt = (extra = {}) => ({ sessionId: OTHER, pid: 5151, kind: 'interactive', name: 'api-docs', cwd: '/w/docs', status: 'waiting', waitingFor: 'dialog open', ...extra });
+
+// Claude Code's own drawing: a header, then a /usage panel under a rule, written in place with cursor moves, a
+// placeholder erased and rewritten, and the hint that the panel closes with Esc
+const USAGE_PANEL = [
+  '\x1b[?1049h\x1b[2J\x1b[H',
+  '\x1b[1;2H\x1b[1mClaude Code\x1b[22m\x1b[1;20Hv9.9.9',
+  `\x1b[20;1H\x1b[38;2;136;136;136m${'▔'.repeat(100)}\x1b[39m`,
+  '\x1b[21;4HSettings  Status  Usage',
+  '\x1b[23;4HCurrent session',
+  '\x1b[24;4HLoading…',
+  '\x1b[24;4H\x1b[K█████\x1b[50G23% used',
+  '\x1b[25;4HResets 3pm (Europe/London)',
+  '\x1b[27;4HCurrent week (all models)',
+  '\x1b[28;4H████████\x1b[50G16% used',
+  '\x1b[29;4HResets Nov 21, 1:30am (Asia/Kolkata)',
+  '\x1b[31;4HCurrent week (Fable)',
+  '\x1b[32;4H██████\x1b[50G12% used',
+  '\x1b[33;4HResets Nov 21, 1:29am (Asia/Kolkata)',
+  '\x1b[35;4H\x1b[2mEsc to cancel\x1b[22m',
+].join('');
+
+// a background session at a dialog: its tty answers ps and stty, its output is the panel above
+function backgroundAtDialog() {
+  putFake('agents.json', sessionList(bgAt(), docsAt({ status: 'idle', waitingFor: undefined })));
+  putFake('logs-bg01', USAGE_PANEL);
+  fakeTool('ps', 'echo "pts/9 Ssl+"');
+  fakeTool('stty', 'echo "40 120"');
+}
+
+test('screen reads a background session\'s open panel from its own output; peek and take-over carry it', async () => {
+  backgroundAtDialog();
+  const r = await clawdctl(['screen', 'api-fix']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.status, 'waiting: dialog open');
+  assert.equal(r.json.dialogOpen, true);
+  assert.equal(r.json.source, 'logs');
+  assert.ok(Date.parse(r.json.capturedAt) > Date.now() - 60_000);
+  assert.match(r.json.text, /^Settings {2}Status {2}Usage/);
+  assert.match(r.json.text, /Current session\n█████ +23% used\nResets 3pm \(Europe\/London\)/);
+  assert.match(r.json.text, /Esc to cancel$/);
+  assert.doesNotMatch(r.json.text, /Claude Code|Loading/);
+
+  const whole = await clawdctl(['screen', 'api-fix', '--full']);
+  assert.match(whole.json.text, /^ Claude Code {7}v9\.9\.9/);
+
+  const peek = await clawdctl(['peek', 'api-fix']);
+  assert.match(peek.json.screen.text, /Current week \(Fable\)/);
+  fs.mkdirSync(path.join(dir, 'live'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'live', `${SESSION}.json`), '{}');
+  const taken = await clawdctl(['take-over', 'api-fix']);
+  assert.equal(taken.json.pickedUp, true);
+  assert.match(taken.json.screen.text, /Current session/);
+
+  await clawdctl(['config', 'screen', 'off']);
+  assert.equal((await clawdctl(['peek', 'api-fix'])).json.screen, undefined);
+  assert.equal((await clawdctl(['config', 'show'])).json.screen, 'off');
+  assert.equal((await clawdctl(['screen', 'api-fix'])).json.source, 'logs');
+});
+
+test('--dismiss sends Escape to a background session through claude attach, and only while a dialog is open', async () => {
+  backgroundAtDialog();
+  putFake('after-attach.json', sessionList(bgAt({ status: 'idle', waitingFor: undefined })));
+  // script gives claude attach a terminal; this one just runs the command it wraps, on either platform's arguments
+  fakeTool('script', 'while [ $# -gt 0 ]; do case "$1" in -qfec|-c) cmd="$2"; shift ;; esac; shift; done; exec sh -c "$cmd"');
+
+  const r = await clawdctl(['screen', 'api-fix', '--dismiss']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.dismissed, true, r.json.dismissNote);
+  assert.match(r.json.text, /Current week/);
+  assert.equal(readFake('attach-input'), '\x1b\x04\x04');
+
+  fs.rmSync(fake('attach-input'));
+  const idle = await clawdctl(['screen', 'api-fix', '--dismiss']);
+  assert.equal(idle.json.dialogOpen, false);
+  assert.equal(idle.json.dismissed, false);
+  assert.match(idle.json.dismissNote, /No dialog is open/);
+  assert.equal(readFake('attach-input'), '');
+});
+
+test('an interactive session is read from the tmux pane that holds its own tty, and from nothing else', async () => {
+  putFake('agents.json', sessionList(docsAt()));
+  putFake('tmux-panes', '/dev/pts/2 %1\n/dev/pts/3 %4\n');
+  putFake('after-keys.json', sessionList(docsAt({ status: 'idle', waitingFor: undefined })));
+  fakeTool('ps', 'cat "$F/ps"');
+  fakeTool('tmux', `case "$1" in
+  list-panes) cat "$F/tmux-panes" ;;
+  capture-pane) if [ "$4" = "%4" ]; then printf '  Model\\n${'─'.repeat(40)}\\n  Select model\\n  ❯ 1. Sonnet\\n    2. Opus\\n  Enter to confirm · Esc to exit\\n\\n'; else echo 'another pane'; fi ;;
+  send-keys) echo "$*" >> "$F/tmux-keys"; cp "$F/after-keys.json" "$F/agents.json" ;;
+esac`);
+
+  putFake('ps', 'pts/3 Ss+\n');
+  const r = await clawdctl(['screen', 'api-docs', '--dismiss']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.source, 'tmux');
+  assert.equal(r.json.text, 'Select model\n❯ 1. Sonnet\n  2. Opus\nEnter to confirm · Esc to exit');
+  assert.equal(readFake('tmux-keys').trim(), 'send-keys -t %4 Escape');
+  assert.equal(r.json.dismissed, true);
+  putFake('agents.json', sessionList(docsAt()));
+
+  // the session is not in front of its terminal: something else is showing there
+  putFake('ps', 'pts/3 Ss\n');
+  const behind = await clawdctl(['screen', 'api-docs']);
+  assert.equal(behind.json.text, null);
+  assert.match(behind.json.note, /in front of the session/);
+
+  // a tty no reader holds
+  putFake('ps', 'pts/8 Ss+\n');
+  const unknown = await clawdctl(['screen', 'api-docs']);
+  assert.equal(unknown.json.text, null);
+  assert.match(unknown.json.note, /cannot read/);
+});
+
+test('a session with no terminal of its own falls back to its own account, once the bot has it', async () => {
+  putFake('agents.json', sessionList(docsAt()));
+  fakeTool('ps', 'echo "?? Ss"');
+  const none = await clawdctl(['screen', 'api-docs']);
+  assert.equal(none.json.source, null);
+  assert.match(none.json.note, /no terminal of its own/);
+
+  await clawdctl(['take-over', 'api-docs']);
+  fs.writeFileSync(path.join(dir, 'screen', `${OTHER}.json`), JSON.stringify({ command: 'cost', at: Date.now(), text: '/cost is open.\nTotal cost: $0.42' }));
+  const own = await clawdctl(['screen', 'api-docs']);
+  assert.equal(own.json.source, 'session');
+  assert.equal(own.json.command, 'cost');
+  assert.match(own.json.text, /Total cost: \$0\.42/);
+  assert.match(own.json.note, /not its screen/);
+});
+
+test('a session stuck at a dialog reaches the bot as a dialog event with the panel\'s text', async () => {
+  backgroundAtDialog();
+  await clawdctl(['config', 'webhook', '--url', hookUrl()]);
+  const r = await clawdctl(['dialog-check', '--session', SESSION, '--command', 'usage']);
+  assert.equal(r.json.queued, true, r.stderr);
+  await until(() => received.length === 1);
+  const [event] = received[0].body.events;
+  assert.equal(event.kind, 'dialog');
+  assert.equal(event.command, 'usage');
+  assert.equal(event.source, 'logs');
+  assert.match(event.screen, /Current week \(all models\)\n████████ +16% used/);
+  assert.match(received[0].body.text, /api-fix is stuck at a dialog \(\/usage\): Settings {2}Status {2}Usage · Current session · █████ +23% used/);
+
+  // gone by the time it is checked: nothing is sent
+  putFake('agents.json', sessionList(bgAt({ status: 'idle', waitingFor: undefined })));
+  assert.equal((await clawdctl(['dialog-check', '--session', SESSION])).json.dialogOpen, false);
+  await clawdctl(['config', 'screen', 'off']);
+  putFake('agents.json', sessionList(bgAt()));
+  await clawdctl(['dialog-check', '--session', SESSION]);
+  assert.deepEqual(listOutbox(), []);
+});
+
+test('usage reads a throwaway session\'s /usage panel, removes the session, and keeps the reading a few minutes', async () => {
+  putFake('bg-agents.json', sessionList({ sessionId: 'usage-0000', id: 'bg77', pid: 7777, kind: 'background', name: 'clawd-usage', cwd: home, status: 'waiting', waitingFor: 'dialog open' }));
+  putFake('logs-bg77', USAGE_PANEL);
+  fakeTool('ps', 'echo "pts/9 Ssl+"');
+  fakeTool('stty', 'echo "40 120"');
+
+  const r = await clawdctl(['usage']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.source, 'usage-panel');
+  assert.deepEqual(r.json.limits.map((l) => [l.id, l.label, l.percentUsed]), [
+    ['session', 'Current session', 23],
+    ['week', 'Current week (all models)', 16],
+    ['week:fable', 'Current week (Fable)', 12],
+  ]);
+  assert.equal(r.json.limits[1].resets, 'Nov 21, 1:30am (Asia/Kolkata)');
+  assert.match(r.json.limits[1].resetsAt, /^\d{4}-11-20T20:00:00\.000Z$/);
+  assert.match(r.json.text, /Esc to cancel/);
+  const calls = readFake('calls').trim().split('\n');
+  assert.deepEqual(calls, [`bg ${fs.realpathSync(home)} --bg -n clawd-usage /usage`, 'stop bg77', 'rm bg77']);
+
+  // a second ask inside five minutes uses that reading; --fresh reads the panel again
+  assert.equal((await clawdctl(['usage'])).json.source, 'usage-panel');
+  assert.equal(readFake('calls').trim().split('\n').length, 3);
+  await clawdctl(['usage', '--fresh']);
+  assert.equal(readFake('calls').trim().split('\n').length, 6);
+});
+
+test('usage takes a session\'s own fresh reading of its limits when there is one, and says how to fix an untrusted folder', async () => {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'usage.json'), JSON.stringify({ at: Date.now(), sessionId: SESSION, rateLimits: [{ kind: 'five_hour', percentUsed: 23.5, resetsAt: '2026-11-15T15:00:00.000Z' }, { kind: 'seven_day', percentUsed: 16 }] }));
+  const r = await clawdctl(['usage']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.source, 'session');
+  assert.deepEqual(r.json.limits, [
+    { id: 'session', label: 'Current session', percentUsed: 23.5, resetsAt: '2026-11-15T15:00:00.000Z' },
+    { id: 'week', label: 'Current week (all models)', percentUsed: 16 },
+  ]);
+  assert.equal(readFake('calls'), '');
+
+  putFake('untrusted', '');
+  const refused = await clawdctl(['usage', '--fresh']);
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /not trusted.*config usage-folder/s);
+  const set = await clawdctl(['config', 'usage-folder', root]);
+  assert.equal(set.json.usageFolder, root);
 });
