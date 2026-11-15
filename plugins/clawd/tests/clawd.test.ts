@@ -309,20 +309,22 @@ test('allowed for the session, the same command is not held again; another one i
   expect(held).toBe(2)
 })
 
-test('a plan for approval reaches the bot whole', async ($, on) => {
+test('a held session is kept out of plan mode, and a plan already waiting reaches the bot whole', async ($, on) => {
   const files = new Map([[CONTROL, takenOver()]])
   engine(on, files, () => ({ exitCode: 0, stdout: '{"decision":"allow"}' }))
   on('tool.check', () => ({ decision: 'ask' }))
   await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
   const plan = `# Plan\n${'- step\n'.repeat(200)}`
 
-  const checked = await $.tool.check({ tool: 'ExitPlanMode', input: { plan } })
-  const r = await $.classic.PermissionRequest({ tool_name: 'ExitPlanMode', tool_input: { plan } })
+  const enter = await $.tool.check({ tool: 'EnterPlanMode', input: {} })
+  const exit = await $.tool.check({ tool: 'ExitPlanMode', input: { plan } })
 
-  const ask = (outbox(files) as unknown as { kind: string; summary?: string }[]).find(e => e.kind === 'ask')!
-  expect(checked.decision).toBe('ask')
-  expect(ask.summary).toBe(plan)
-  expect(r.decision).toEqual({ behavior: 'allow' })
+  expect(enter.decision).toBe('deny')
+  expect(enter.reason).toContain('write your plan as your reply')
+  expect(exit.decision).toBe('ask')
+  const events = outbox(files) as unknown as { kind: string; plan?: string }[]
+  expect(events.find(e => e.kind === 'plan')!.plan).toBe(plan)
+  expect(events.some(e => e.kind === 'ask')).toBe(false)
 })
 
 test('a session near the end of its context says so once', async ($, on) => {

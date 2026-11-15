@@ -20,6 +20,7 @@ const WAIT_STEP_S = 540
 const KEEPALIVE_STEP_S = 480
 const FLUSH_EVERY_MS = 5000
 const FLUSH_BACKOFF_MAX_MS = 300_000
+const PLAN_BY_REPLY = 'Clawd Bot has this session, and plan mode can only be approved at the session itself. Do not enter plan mode: write your plan as your reply and stop there. The go-ahead, or the changes wanted, will come as a message.'
 const ANSWER_CHARS = 8000
 const GIST_CHARS = 1500
 
@@ -501,8 +502,15 @@ export const register: Register = on => {
 
   on('tool.check', async ($, e, next) => {
     const r = await next(e)
-    // a plan's own dialog stays up whatever tool.check says: the PermissionRequest hook below answers it
-    if (r.decision !== 'ask' || e.tool === 'AskUserQuestion' || e.tool === 'AskPerson' || e.tool === 'ExitPlanMode') return r
+    if (e.tool === 'EnterPlanMode' || e.tool === 'ExitPlanMode') {
+      control = await readControl($)
+      if (!control) return r
+      // a plan dialog answers only to the session itself or its host (Remote Control), never to a hook, so the bot takes plans as replies
+      if (e.tool === 'EnterPlanMode') return { decision: 'deny', reason: PLAN_BY_REPLY }
+      if (r.decision === 'ask') await emit($, 'plan', { plan: summarize(e.tool, e.input) }).catch(() => undefined)
+      return r
+    }
+    if (r.decision !== 'ask' || e.tool === 'AskUserQuestion' || e.tool === 'AskPerson') return r
     control = await readControl($)
     if (!control) return r
     const set = byPermissions(control, e.tool, e.input)
@@ -539,19 +547,6 @@ export const register: Register = on => {
       decision = { question: e.ask.slice(0, 300), options }
     }
     return r
-  })
-
-  // approving a plan is the person's: only a PermissionRequest answer closes its dialog
-  on('classic.PermissionRequest', async ($, e, next) => {
-    if (e.tool_name !== 'ExitPlanMode') return next(e)
-    control = await readControl($)
-    if (!control) return next(e)
-    const held = await hold<PermissionAnswer>($, 'permission', { tool: 'ExitPlanMode', summary: summarize('ExitPlanMode', e.tool_input), reason: null, subagent: null }, 'plan approval')
-    if (held.kind === 'released') return next(e)
-    const { decision, reason } = held.answer
-    return decision === 'allow'
-      ? { decision: { behavior: 'allow' as const } }
-      : { decision: { behavior: 'deny' as const, message: reason ?? 'The plan was not approved through Clawd Bot.' } }
   })
 
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {

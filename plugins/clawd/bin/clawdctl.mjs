@@ -148,6 +148,7 @@ const commands = {
     const args = ['--bg', '--remote-control', label, '-n', label];
     if (model) args.push('--model', model);
     if (effort) args.push('--effort', effort);
+    if (permissionMode === 'plan') refuse('A session you hold cannot be in plan mode: its plan dialog answers only at the session. Ask it in the prompt to reply with a plan and wait for the go-ahead.');
     if (permissionMode) args.push('--permission-mode', permissionMode);
     if (prompt) args.push(prompt);
     let out;
@@ -466,7 +467,7 @@ const commands = {
         e.name = byId.get(e.sessionId)?.name ?? null;
         // the engine tells the mod a turn failed but not why; the session's transcript has the error
         if (e.kind === 'failed' && !e.answer) e.answer = lastApiError(e.sessionId) ?? '';
-        if (e.kind === 'remote') e.remoteUrl = remoteUrlOf(e.sessionId) ?? null;
+        if (e.kind === 'remote' || e.kind === 'plan') e.remoteUrl = remoteUrlOf(e.sessionId) ?? null;
         if (Array.isArray(e.media)) e.media = mediaFiles(e);
       }
       writeJson(sub('push-state.json'), { lastPushAt: Date.now() });
@@ -741,7 +742,6 @@ function extras(e) {
 
 function line(e) {
   const who = `[${machine()}] ${e.name ?? path.basename(e.cwd ?? '') ?? e.sessionId?.slice(0, 8)}`;
-  if (e.kind === 'ask' && e.ask === 'permission' && e.tool === 'ExitPlanMode') return `${who} has a plan for approval (ask ${e.askId}, mode ${e.mode}): ${clip(e.summary, 600)}`;
   if (e.kind === 'ask' && e.ask === 'permission') return `${who} wants permission for ${e.tool}: ${clip(e.summary, 600)} (ask ${e.askId}, mode ${e.mode})`;
   if (e.kind === 'context') return `${who} has used ${e.contextPercent}% of its context; it will compact soon.`;
   if (e.kind === 'ask') return `${who} asks: ${(e.questions ?? []).map((q) => `${q.question} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`).join(' ')} (ask ${e.askId}, mode ${e.mode})`;
@@ -754,6 +754,7 @@ function line(e) {
   if (e.kind === 'steer_failed') return `${who} could not run on ${[e.model, e.effort].filter(Boolean).join(' ')}; it went back to its own model and effort.`;
   if (e.kind === 'failed') return `${who} failed (${e.reason}): ${clip(e.answer, 300)}`;
   if (e.kind === 'request') return `${who} asks Grok Bot (request ${e.requestId}): ${clip(e.task, 600)}`;
+  if (e.kind === 'plan') return `${who} is in plan mode with a plan waiting, which only the session or Remote Control can approve${e.remoteUrl ? ` (${e.remoteUrl})` : ''}: ${clip(e.plan, 600)}`;
   if (e.kind === 'remote') return e.remoteUrl ? `${who} Remote Control: ${e.remoteUrl}` : `${who}: Remote Control could not be turned on here.`;
   if (e.kind === 'ci') return `${who} CI ${e.state === 'fail' ? 'failed' : 'passed'} on PR #${e.pr?.number} ${e.pr?.url ?? ''}${e.failing?.length ? ` (${e.failing.map((f) => f.name).join(', ')})` : ''}${e.woke ? '. The session was woken to fix it.' : ''}`;
   if (e.kind === 'budget') return `${who} ${e.level === 'stopped' ? 'stopped at its budget' : 'is at 80% of its budget'}: $${e.costUsd} of $${e.budgetUsd}.`;
@@ -833,13 +834,13 @@ const S = { type: 'string' };
 const TOOLS = [
   ['machine_info', 'This machine: its name, platform, Claude Code version, and whether pushes to your webhook are set up.', {}, [], 'info'],
   ['list_sessions', 'Every Claude Code session running on this machine: id, name, folder, status (busy, idle, waiting on a question or permission), whether you have taken it over, its mode, open asks, and the last answer of a taken-over session.', { all: { type: 'boolean', description: 'Also list finished background sessions.' } }, [], 'sessions'],
-  ['start_session', 'Start a new Claude Code session in the background, already taken over by you, with Remote Control on so the person can open it on their phone, the web or the Claude app. Always pass model and effort; Opus at high effort is costly for small jobs. Returns the Remote Control link and the attach command.', { folder: { ...S, description: 'Absolute folder, or ~/…' }, prompt: { ...S, description: 'The first message.' }, name: S, model: { ...S, description: 'e.g. sonnet, opus, haiku' }, effort: { ...S, description: 'low, medium, high, xhigh or max' }, mode: { ...S, enum: ['handle', 'babysit'] }, permissionMode: { ...S, enum: ['default', 'acceptEdits', 'plan', 'auto', 'dontAsk'] } }, ['folder', 'prompt'], 'start'],
+  ['start_session', 'Start a new Claude Code session in the background, already taken over by you, with Remote Control on so the person can open it on their phone, the web or the Claude app. Always pass model and effort; Opus at high effort is costly for small jobs. Returns the Remote Control link and the attach command.', { folder: { ...S, description: 'Absolute folder, or ~/…' }, prompt: { ...S, description: 'The first message.' }, name: S, model: { ...S, description: 'e.g. sonnet, opus, haiku' }, effort: { ...S, description: 'low, medium, high, xhigh or max' }, mode: { ...S, enum: ['handle', 'babysit'] }, permissionMode: { ...S, enum: ['default', 'acceptEdits', 'auto', 'dontAsk'] } }, ['folder', 'prompt'], 'start'],
   ['take_over', 'Take over a running session: from now its questions and permissions come to you instead of the screen, and you can steer it. Ask the person first unless they told you to.', { session: S, mode: { ...S, enum: ['handle', 'babysit'] } }, ['session'], 'take_over'],
   ['release', 'Give a session back to the person at the machine. Any question you were holding goes back to the local dialog.', { session: S }, ['session'], 'release'],
   ['set_mode', 'handle: you answer routine questions and permissions yourself and ask the person when unsure or risky (pushing, deleting, deploying, anything leaving the machine). babysit: every ask goes to the person.', { session: S, mode: { ...S, enum: ['handle', 'babysit'] } }, ['session', 'mode'], 'set_mode'],
   ['list_asks', 'Open questions and permission requests from taken-over sessions on this machine, each with how many minutes it has waited.', { session: S, olderThan: { type: 'number', description: 'Only asks waiting at least this many minutes.' } }, [], 'asks'],
   ['check_update', 'Whether a newer Clawd release is out than the one installed on this machine, and the command that updates it.', {}, [], 'check_update'],
-  ['answer', 'Answer an open ask. A permission takes decision allow or deny (and a reason the session will read); remember true with allow allows that exact command, or that tool, for the rest of the session. A plan (tool ExitPlanMode) is approved with allow, or sent back with deny and the changes wanted as reason. A question takes pick (the option label, for one question) or answers (an object from question text to answer).', { ask: S, decision: { ...S, enum: ['allow', 'deny'] }, reason: S, remember: { type: 'boolean' }, pick: S, answers: { type: 'object' } }, ['ask'], 'answer'],
+  ['answer', 'Answer an open ask. A permission takes decision allow or deny (and a reason the session will read); remember true with allow allows that exact command, or that tool, for the rest of the session. A question takes pick (the option label, for one question) or answers (an object from question text to answer).', { ask: S, decision: { ...S, enum: ['allow', 'deny'] }, reason: S, remember: { type: 'boolean' }, pick: S, answers: { type: 'object' } }, ['ask'], 'answer'],
   ['send_message', 'Send a message to a taken-over session, as if the person typed it. It runs when the session is next idle. file attaches a file put with put_file.', { session: S, text: S, file: S }, ['session', 'text'], 'send'],
   ['put_file', 'Put a file from the chat onto this machine (an https link, up to 20 MB), to attach with send_message.', { name: S, url: S }, ['name', 'url'], 'put'],
   ['interrupt', 'Stop what a taken-over session is doing right now (like pressing Esc).', { session: S }, ['session'], 'interrupt'],

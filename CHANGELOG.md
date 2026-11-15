@@ -1,8 +1,15 @@
 # Changelog
 
+## 0.6.3
+
+- Plans go to the bot as replies. A plan dialog answers only at the session itself or through Remote Control, never to a hook, so the bot's approval left sessions stuck at it. A session the bot holds now refuses plan mode and writes its plan as its reply, and the bot approves, revises or rejects it with a message.
+- A session already in plan mode sends a `plan` event with the whole plan and its Remote Control link, where the person approves it.
+- `start` no longer offers plan mode.
+- The events routine prompt is now v5.
+
 ## 0.6.2
 
-- The bot's approval of a plan now closes the session's own plan dialog. Before, the session took the answer but stayed at its dialog, since a plan only closes on a PermissionRequest answer.
+- Tried to answer plan dialogs through a PermissionRequest hook. That did not close them; 0.6.3 replaces it.
 - A `ci` event names the failing checks with any `gh` version. Older `gh` releases have no `pr checks --json`, so the names now come from the PR's check rollup.
 
 ## 0.6.1

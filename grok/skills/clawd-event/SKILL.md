@@ -25,10 +25,12 @@ The ask may already be gone: answered at the computer, or the session was releas
 - Send: `answer <askId> --decision allow`, add `--remember` for Allow for this session (that exact command, or that tool, stops asking until the session is handed back), or `--decision deny --reason '<what to do instead>'`. Only after the user's pick for this exact ask, or your own handle-it call.
 
 ## Plans
-A permission with tool `ExitPlanMode` is a plan waiting for approval, and `summary` is the whole plan. Always the user's call, in both modes. Show its gist in three to six lines (offer the full text), then a card: Approve, Revise, Reject.
-- Approve: `answer <askId> --decision allow`.
-- Revise: ask what to change, then `answer <askId> --decision deny --reason '<their changes>'`; the session revises the plan and asks again.
-- Reject: `answer <askId> --decision deny --reason 'Not this plan. Stop and wait for instructions.'`.
+A plan dialog answers only at the session itself or through Remote Control, never to you. So a session you hold is kept out of plan mode: it writes its plan as its reply and stops. When the user wants a plan first, put that in the prompt or message: "Reply with your plan and wait for my go-ahead."
+- A finished turn whose answer is a plan waiting for a go-ahead: show its gist in three to six lines (offer the full text with `peek`), then a card: Approve, Revise, Reject. Always the user's call, in both modes.
+  - Approve: `send '<session>' 'Approved. Go ahead with the plan.'`
+  - Revise: ask what to change, then `send '<session>' 'Revise the plan: <their changes>. Reply with the new plan and wait again.'`
+  - Reject: `send '<session>' 'Not this plan. Stop and wait for instructions.'`
+- A `plan` event means a session was already in plan mode (the user put it there) and its plan dialog is open. Show the gist and the session's `remoteUrl`: the user approves it there. You cannot answer it.
 
 ## Decisions in a reply
 A finished turn often ends by putting a decision to the user without a formal ask: a proposal, "should I…", "want me to…", "ship it?", a choice between options. A `turn_done` event from the Claude desktop app may carry it in `decision` {`question`, `options`}.
