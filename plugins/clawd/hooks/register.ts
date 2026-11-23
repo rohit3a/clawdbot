@@ -381,6 +381,7 @@ const progressSeen = new Map<string, { mark: string; at: number }>()
 const stuckSaid = new Set<string>()
 const stoppedByBot = new Set<string>()
 let overseerControlMissing = false
+let agentsVersion = -1
 // what the bot set through Overseer's control, per subagent, to undo at release
 const steeredByOverseer = new Map<string, Set<'model' | 'effort' | 'pause'>>()
 
@@ -427,6 +428,18 @@ async function writeMirror($: $, overseer = true): Promise<void> {
   await $.fs.write(`${await subDir($)}/agents.json`, JSON.stringify({ sessionId: await myId($), pid, at: Date.now(), overseer, agents }))
 }
 
+// Overseer's writes made inside Clawd's own call to its control never reach Clawd's state.set hook (a plugin does
+// not see what its own call causes), so after one, and on each tick while held, the state is read when it moved
+async function refreshAgents($: $): Promise<void> {
+  if (agentsSeen === undefined) return
+  const read = await Promise.resolve()
+    .then(() => $.state.get(OVERSEER_AGENTS))
+    .catch(() => undefined)
+  if (!read || read.version === agentsVersion) return
+  agentsVersion = read.version
+  sawAgents($, read.value)
+}
+
 function sawAgents($: $, agents: Record<string, OverseerAgent> | undefined): void {
   agentsSeen = agents ?? {}
   if (Date.now() - lastMirrorAt >= MIRROR_GAP_MS) void writeMirror($).catch(() => undefined)
@@ -462,6 +475,7 @@ async function lookForOverseer($: $): Promise<void> {
   }
   overseerChecked = true
   agentsSeen = agents.value ?? {}
+  agentsVersion = agents.version
   for (const a of Object.values(agentsSeen)) statusSeen.set(a.id, a.status)
   await writeMirror($)
 }
@@ -581,6 +595,7 @@ async function overseerControl($: $, a: OverseerAgent, s: SubagentSteer): Promis
     return undefined
   }
   if (answer.code === 'courier-missing') return undefined
+  await refreshAgents($)
   if (answer.ok) {
     const set = steeredByOverseer.get(a.id) ?? new Set()
     if (s.op === 'model' || s.op === 'effort') set.add(s.op)
@@ -600,6 +615,7 @@ async function undoOverseerSteer($: $): Promise<void> {
       await Promise.resolve($.tool.call({ tool: OVERSEER_CONTROL, agent, ...undo } as never)).catch(() => undefined)
     }
   }
+  if (steeredByOverseer.size) await refreshAgents($)
   steeredByOverseer.clear()
 }
 
@@ -795,6 +811,7 @@ async function tickOnce($: $): Promise<void> {
     return
   }
   await drainInbox($)
+  await refreshAgents($)
   const every = control.reportEveryMin
   if (every && every > 0 && Date.now() - Math.max(lastReportAt, control.since) >= every * 60_000) {
     lastReportAt = Date.now()
@@ -920,7 +937,10 @@ export const register: Register = on => {
   // Overseer wrote its subagents: keep the copy for clawdctl, and tell the bot of any that ended
   on('state.set', { plugin: 'overseer', key: 'agents' }, async ($, e, next) => {
     const r = await next(e)
-    if ('value' in r && r.value?.isSet === true) sawAgents($, e.value as Record<string, OverseerAgent>)
+    if ('value' in r && r.value?.isSet === true) {
+      agentsVersion = r.value.version
+      sawAgents($, e.value as Record<string, OverseerAgent>)
+    }
     return r
   }).catch(($, e, next) => next(e))
 
