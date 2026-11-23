@@ -6,7 +6,9 @@ description: >-
   model, effort or mode, set progress reports, read what it said, stop it. Use
   for "what's running", "start Claude on…", "take over…", "tell it to…",
   "switch to sonnet", "babysit it", "give it back", "what did it say",
-  "what's on its screen", "close that dialog", "how much usage is left".
+  "what's on its screen", "close that dialog", "how much usage is left",
+  "what are its subagents doing", "tell the codex agent…", "pause that
+  subagent", "stop the subagent".
 ---
 Follow clawd-rules first.
 
@@ -56,6 +58,17 @@ A session whose status is `waiting: dialog open` sits at a panel such as /usage,
 
 ## Plan usage
 "How much usage is left", "when does my limit reset": `usage` on that computer. Report each of `limits` in one line: `label`, `percentUsed`, and `resetsAt` in the user's time zone. A reading under 5 minutes old is used as it is; `--fresh` reads /usage again in a throwaway session that makes no model request, about 10 seconds. A "not trusted" refusal names the fix: relay it. The limits are the account's, so one computer is enough.
+
+## Subagents
+A session's subagents are the Claude subagents (Agent tool) and Codex agents it started. Clawd sees them through Overseer; without it, `subagents` refuses with the install commands: relay them, and offer to run them only after the user's yes (clawd-setup).
+- "What are its subagents doing": `subagents '<X>'`. One line each: `name`, `kind`, `model`, `status`, `steps`, and `activity` for a running one. `pausedByBot`, `next` (a model or effort you set) and `stopping` show your own steering. A `note` says why the list is empty or stale.
+- "What did it say": `subagent '<X>' '<id or name>' --count 6`. Sum up its last entries; `prompt` is the task its parent gave it.
+- Steering needs the session taken over, as for the session itself. Name the subagent by id, the start of its id, or its name.
+  - Message: `subagent '<X>' '<id>' send '<text>'`. Pass the user's words. A running one gets it with its next request (Codex: in its current turn); a finished one wakes under the same id with its history. Its answer arrives as a `subagent` event.
+  - Model or effort: `subagent '<X>' '<id>' model <m>` or `effort <level>`.
+  - Pause and resume: `subagent '<X>' '<id>' pause`, then `resume`. Claude subagents only. A paused one waits until you resume, stop or release the session.
+  - Stop: `subagent '<X>' '<id>' stop`. A Claude subagent ends at its next request; a Codex agent's running turn stops. A message continues either later.
+- clawdctl prints `done` with a `note` on what happened, or `queued` when the session didn't answer within seconds: say it will apply when the session next checks. A refusal is one sentence: relay it.
 
 ## Stop
 `stop '<X>'` ends a background session; it can be resumed later with the `resume` command it prints. An interactive session can't be stopped from here: interrupt it and hand it back.

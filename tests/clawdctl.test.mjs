@@ -722,3 +722,136 @@ test('usage takes a session\'s own fresh reading of its limits when there is one
   const set = await clawdctl(['config', 'usage-folder', root]);
   assert.equal(set.json.usageFolder, root);
 });
+
+// ---------- subagents, through Overseer ----------
+
+const T0 = Date.parse('2026-11-23T10:00:00Z');
+const mirror = (agents) => {
+  fs.mkdirSync(path.join(dir, 'subagents', SESSION), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'subagents', SESSION, 'agents.json'), JSON.stringify({ sessionId: SESSION, pid: 1, at: T0 + 60_000, overseer: true, agents }));
+};
+const SLEEPER = {
+  id: 'ad0ab1e3e157d92d6', kind: 'claude', name: 'sleeper', type: 'general-purpose', description: 'Sleeper', status: 'running', startedAt: T0, spawnPrompt: 'Run sleep 25 three times.',
+  model: 'claude-sonnet-5-5', effort: 'low', steps: 3, tokensIn: 1200, tokensOut: 80, activity: 'Bash: sleep 25',
+  thread: [{ at: T0, by: 'parent', text: 'Run sleep 25 three times.' }, { at: T0 + 5_000, by: 'tool', text: 'Bash: sleep 25' }, { at: T0 + 30_000, by: 'tool', text: 'Bash: sleep 25' }],
+};
+const CODEX = {
+  id: 'codex-mwhp3qcg-1', kind: 'codex', name: 'codexsleeper', type: 'codex', description: 'sleep 45', status: 'completed', startedAt: T0, endedAt: T0 + 50_000, spawnPrompt: 'Run sleep 45, then reply CODEXDONE.',
+  model: 'gpt-6.1-terra', effort: 'xhigh', steps: 1, tokensIn: 99569, tokensOut: 156, activity: '', codex: { threadId: '01a1dec3', isAlive: true, cwd: '/w/api' },
+  thread: [{ at: T0, by: 'parent', text: 'Run sleep 45, then reply CODEXDONE.' }, { at: T0 + 50_000, by: 'agent', text: 'CODEXDONE' }],
+};
+const installOverseer = () => {
+  const cfg = path.join(home, '.claude', 'plugins');
+  fs.mkdirSync(cfg, { recursive: true });
+  fs.writeFileSync(path.join(cfg, 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: { 'overseer@overseer': [{ scope: 'user', version: '0.3.0' }], 'overseer-courier@overseer': [{ scope: 'user', version: '0.3.0' }] } }));
+};
+// stands in for the mod: answers the next subagent item that reaches the session's inbox
+const modAnswers = async (answer) => {
+  let item;
+  await until(() => {
+    const box = path.join(dir, 'inbox', SESSION);
+    item = fs.existsSync(box) ? fs.readdirSync(box).map((n) => read('inbox', SESSION, n)).find((m) => m.type === 'subagent' && !m.seen) : undefined;
+    return !!item;
+  });
+  for (const n of fs.readdirSync(path.join(dir, 'inbox', SESSION))) fs.rmSync(path.join(dir, 'inbox', SESSION, n));
+  fs.writeFileSync(path.join(dir, 'answers', `${item.id}.json`), JSON.stringify(answer));
+  return item;
+};
+
+test('subagents says cleanly when Overseer is not installed, and when a session has none to report', async () => {
+  const none = await clawdctl(['subagents', 'api-fix']);
+  assert.equal(none.code, 1);
+  assert.match(none.stderr, /Overseer is not installed.*claude plugin install overseer@overseer/s);
+
+  installOverseer();
+  const empty = await clawdctl(['subagents', 'api-fix']);
+  assert.equal(empty.code, 0, empty.stderr);
+  assert.deepEqual(empty.json.subagents, []);
+  assert.deepEqual(empty.json.overseer, { installed: true, version: '0.3.0', courier: true });
+  assert.match(empty.json.note, /restarted/);
+});
+
+test('subagents lists Claude and Codex subagents as Overseer sees them, with what the bot set', async () => {
+  mirror([SLEEPER, CODEX]);
+  const d = path.join(dir, 'subagents', SESSION);
+  fs.writeFileSync(path.join(d, 'steer.json'), JSON.stringify({ [SLEEPER.id]: { effort: 'medium' } }));
+  fs.writeFileSync(path.join(d, `pause-${SLEEPER.id}`), '1');
+  fs.writeFileSync(path.join(d, `holding-${SLEEPER.id}`), '1');
+  const r = await clawdctl(['subagents', 'api-fix']);
+  assert.equal(r.code, 0, r.stderr);
+  const [s, c] = r.json.subagents;
+  assert.deepEqual(
+    { id: s.id, name: s.name, kind: s.kind, model: s.model, effort: s.effort, status: s.status, steps: s.steps, tokens: s.tokens, lastActivityAt: s.lastActivityAt, next: s.next, pausedByBot: s.pausedByBot },
+    { id: SLEEPER.id, name: 'sleeper', kind: 'claude', model: 'claude-sonnet-5-5', effort: 'low', status: 'paused', steps: 3, tokens: { in: 1200, out: 80 }, lastActivityAt: '2026-11-23T10:00:30.000Z', next: { effort: 'medium' }, pausedByBot: true },
+  );
+  assert.deepEqual([c.kind, c.status, c.model, c.codex], ['codex', 'completed', 'gpt-6.1-terra', { threadId: '01a1dec3', running: false, alive: true }]);
+  assert.deepEqual((await clawdctl(['sessions'])).json.sessions.find((x) => x.session === SESSION).subagents, { running: 1, total: 2 });
+});
+
+test('subagent shows the prompt and the recent thread, found by name or the start of its id', async () => {
+  mirror([SLEEPER, CODEX]);
+  const r = await clawdctl(['subagent', 'api-fix', 'codex-mwhp', '--count', '1']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.json.prompt, 'Run sleep 45, then reply CODEXDONE.');
+  assert.deepEqual(r.json.thread, [{ by: 'agent', at: '2026-11-23T10:00:50.000Z', text: 'CODEXDONE' }]);
+  assert.equal((await clawdctl(['subagent', 'api-fix', 'SLEEPER'])).json.thread.length, 3);
+  assert.match((await clawdctl(['subagent', 'api-fix', 'nobody'])).stderr, /No subagent matches/);
+  assert.match((await clawdctl(['subagent', 'api-fix', 'sleeper', 'dance'])).stderr, /message, model, effort, pause, resume, stop/);
+});
+
+test('steering a subagent needs the session taken over, and goes to the session, which says what it did', async () => {
+  mirror([SLEEPER, CODEX]);
+  assert.match((await clawdctl(['subagent', 'api-fix', 'sleeper', 'pause'])).stderr, /not taken over/);
+  await clawdctl(['take-over', 'api-fix']);
+  assert.match((await clawdctl(['subagent', 'api-fix', 'codexsleeper', 'pause'])).stderr, /pauses Claude subagents only/);
+  assert.match((await clawdctl(['subagent', 'api-fix', 'sleeper', 'effort', 'huge'])).stderr, /Effort is one of/);
+  assert.match((await clawdctl(['subagent', 'api-fix', 'sleeper', 'send'])).stderr, /message text/);
+
+  const [sent, item] = await Promise.all([clawdctl(['subagent', 'api-fix', 'codexsleeper', 'send', 'Reply', 'PAPAYA']), modAnswers({ ok: true, via: 'mcp__overseer__codex', note: 'Codex continues the same thread.' })]);
+  assert.deepEqual([item.op, item.agentId, item.value], ['message', CODEX.id, 'Reply PAPAYA']);
+  assert.equal(sent.code, 0, sent.stderr);
+  assert.deepEqual([sent.json.done, sent.json.via, sent.json.kind], [true, 'mcp__overseer__codex', 'codex']);
+
+  const [refused] = await Promise.all([clawdctl(['subagent', 'api-fix', 'sleeper', 'stop']), modAnswers({ ok: false, reason: 'Overseer has no subagent with that id in this session now.' })]);
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /sleeper: Overseer has no subagent/);
+});
+
+test('the MCP server offers the subagent tools', async () => {
+  mirror([SLEEPER]);
+  const out = execFileSync(process.execPath, [CLAWDCTL, 'mcp'], {
+    env: { ...process.env, HOME: home, CLAWD_HOME: dir, CLAUDE_BIN: path.join(root, 'claude'), CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+    input: `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })}\n${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_subagents', arguments: { session: 'api-fix' } } })}\n`,
+    encoding: 'utf8',
+    timeout: 20_000,
+  }).trim().split('\n').map((l) => JSON.parse(l));
+  const names = out.find((m) => m.id === 1).result.tools.map((t) => t.name);
+  for (const n of ['list_subagents', 'read_subagent', 'message_subagent', 'steer_subagent']) assert.ok(names.includes(n), n);
+  assert.equal(JSON.parse(out.find((m) => m.id === 2).result.content[0].text).subagents[0].name, 'sleeper');
+});
+
+test('release forgets what the bot set for subagents, so a paused one goes on', async () => {
+  mirror([SLEEPER]);
+  await clawdctl(['take-over', 'api-fix']);
+  const d = path.join(dir, 'subagents', SESSION);
+  for (const f of ['steer.json', `pause-${SLEEPER.id}`, `stop-${SLEEPER.id}`]) fs.writeFileSync(path.join(d, f), '{}');
+  await clawdctl(['release', 'api-fix']);
+  assert.deepEqual(fs.readdirSync(d), ['agents.json']);
+});
+
+test('subagent events read as one line each for the bot', async () => {
+  await clawdctl(['config', 'machine', 'Bench']);
+  await clawdctl(['config', 'webhook', '--url', hookUrl()]);
+  const who = { id: CODEX.id, name: 'codexsleeper', kind: 'codex', model: 'gpt-6.1-terra', steps: 1 };
+  queue('subagent', { state: 'finished', subagent: who, answer: 'CODEXDONE MANGO' });
+  queue('subagent', { state: 'stuck', reason: 'no new step for 10 min', subagent: who });
+  queue('subagent', { state: 'stopped', subagent: { ...who, kind: 'claude', model: 'claude-haiku-5-5', name: 'counter' } });
+  queue('subagent', { state: 'failed', error: 'Ended with error', subagent: { ...who, kind: 'claude', model: 'claude-haiku-5-5', name: 'counter' } });
+  await clawdctl(['flush']);
+  assert.deepEqual(received[0].body.text.split('\n').sort(), [
+    '[Bench] api-fix subagent "codexsleeper" (codex, gpt-6.1-terra) finished after 1 steps: CODEXDONE MANGO',
+    '[Bench] api-fix subagent "codexsleeper" (codex, gpt-6.1-terra) looks stuck: no new step for 10 min. clawdctl subagent 11111111 codex-mwhp3qcg-1 shows its thread.',
+    '[Bench] api-fix subagent "counter" (claude, claude-haiku-5-5) failed (Ended with error) after 1 steps.',
+    '[Bench] api-fix subagent "counter" (claude, claude-haiku-5-5) was stopped after 1 steps.',
+  ]);
+});

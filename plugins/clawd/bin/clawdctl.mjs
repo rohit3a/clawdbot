@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { panelOf, render, usageLimits } from './screen.mjs';
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 const HOME = os.homedir();
 const DIR = process.env.CLAWD_HOME || path.join(HOME, '.clawd');
 const PUSH_GAP_MS = 20_000;
@@ -32,7 +32,7 @@ const refuse = (message) => { throw new Refusal(message); };
 
 const sub = (...p) => path.join(DIR, ...p);
 function ensureDirs() {
-  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci', 'files', 'screen']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
+  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci', 'files', 'screen', 'subagents']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
 }
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; }
@@ -102,6 +102,7 @@ function describe(a, asks) {
     idleMin: live && !live.busy && live.lastTurnAt ? Math.floor((Date.now() - live.lastTurnAt) / 60_000) : undefined,
     budgetUsd: control?.budgetUsd,
     askGrok: readJson(sub('grok', `${a.sessionId}.json`))?.enabled ? true : undefined,
+    subagents: subagentCount(a.sessionId),
     remoteUrl: control ? remoteUrlOf(a.sessionId) : undefined,
   };
 }
@@ -187,6 +188,7 @@ const commands = {
   release({ session }) {
     const a = resolve(session);
     writeJson(sub('control', `${a.sessionId}.json`), { takenOver: false });
+    clearSubagentSteer(a.sessionId);
     return { session: a.sessionId, name: a.name, takenOver: false, note: 'Released. Prompts show at the machine again; a question you were holding goes back to the local dialog.' };
   },
 
@@ -308,6 +310,48 @@ const commands = {
     execFileSync(CLAUDE, ['stop', a.id], { encoding: 'utf8', timeout: 30_000 });
     fs.rmSync(sub('control', `${a.sessionId}.json`), { force: true });
     return { session: a.sessionId, stopped: true, resume: `claude --resume ${a.sessionId}` };
+  },
+
+  // --- subagents, as Overseer sees them: Claude and Codex alike ---
+  subagents({ session }) {
+    const a = resolve(session);
+    const { mirror, note } = subagentsOf(a);
+    const steer = steerOf(a.sessionId);
+    return { session: a.sessionId, name: a.name ?? null, overseer: overseerInfo(), seenAt: mirror ? new Date(mirror.at).toISOString() : null, subagents: (mirror?.agents ?? []).map((x) => subagentSummary(x, steer)), ...(note && { note }) };
+  },
+
+  read_subagent({ session, subagent, count }) { return commands.subagent({ session, agent: subagent, count }); },
+  message_subagent({ session, subagent, text }) { return commands.subagent({ session, agent: subagent, op: 'message', value: text }); },
+  steer_subagent({ session, subagent, action, value }) {
+    if (!['model', 'effort', 'pause', 'resume', 'stop'].includes(action)) refuse('action is model, effort, pause, resume or stop.');
+    return commands.subagent({ session, agent: subagent, op: action, value });
+  },
+
+  async subagent({ session, agent, op, value, count }) {
+    const a = resolve(session);
+    const { mirror } = subagentsOf(a);
+    const x = findSubagent(mirror, agent);
+    if (!op) {
+      const n = Math.min(40, Math.max(1, Number(count) || 12));
+      return { session: a.sessionId, ...subagentSummary(x, steerOf(a.sessionId)), description: x.description, prompt: x.spawnPrompt, thread: (x.thread ?? []).slice(-n).map((m) => ({ by: m.by, at: new Date(m.at).toISOString(), text: m.text, ...(m.state && { state: m.state }) })) };
+    }
+    if (!SUBAGENT_OPS.includes(op)) refuse(`Say what to do: ${SUBAGENT_OPS.join(', ')}.`);
+    requireTaken(a);
+    if (op === 'message' && !value) refuse('Give the message text.');
+    if (op === 'model' && !value) refuse('Give a model, or "default" for its own.');
+    if (op === 'effort' && !EFFORTS.includes(value) && value !== 'default') refuse(`Effort is one of ${EFFORTS.join(', ')}, or "default".`);
+    if (x.kind === 'codex' && (op === 'pause' || op === 'resume')) refuse('Overseer pauses Claude subagents only. Stop the Codex turn instead, and message it to go on.');
+    const id = `subagent-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
+    writeJson(sub('inbox', a.sessionId, `${Date.now()}-${randomBytes(3).toString('hex')}.json`), { type: 'subagent', id, op, agentId: x.id, ...(value !== undefined && { value: String(value) }) });
+    const answer = sub('answers', `${id}.json`);
+    const wait = Number(process.env.CLAWD_SUBAGENT_WAIT_MS ?? 8_000);
+    for (const end = Date.now() + wait; Date.now() < end && !fs.existsSync(answer); ) await sleep(200);
+    const done = readJson(answer);
+    fs.rmSync(answer, { force: true });
+    const head = { session: a.sessionId, subagent: x.id, name: x.name, kind: x.kind, op };
+    if (!done) return { ...head, queued: true, note: 'Queued; the session has not picked it up yet. It takes it within a few seconds while it runs.' };
+    if (!done.ok) refuse(`${x.name}: ${done.reason ?? 'not done'}`);
+    return { ...head, done: true, via: done.via, note: done.note };
   },
 
   peek({ session, count }) {
@@ -516,6 +560,112 @@ const commands = {
     }
   },
 };
+
+// ---------- subagents ----------
+//
+// Overseer (rohit3a/overseer) watches every subagent a session starts. The clawd mod in each session copies
+// Overseer's record of them to subagents/<session>/agents.json, and applies the bot's steering from the inbox.
+
+const SUBAGENT_OPS = ['message', 'model', 'effort', 'pause', 'resume', 'stop'];
+const SUBAGENT_KEEP_MS = 7 * 86_400_000;
+const OVERSEER_INSTALL = 'claude plugin marketplace add rohit3a/overseer, then claude plugin install overseer@overseer and claude plugin install overseer-courier@overseer';
+
+function overseerInfo() {
+  const cfg = process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
+  const rows = readJson(path.join(cfg, 'plugins', 'installed_plugins.json'))?.plugins ?? {};
+  const pick = (name) => { const r = rows[name]; return Array.isArray(r) ? r.find((x) => x.scope === 'user') ?? r[0] : undefined; };
+  const o = pick('overseer@overseer');
+  return { installed: !!o, version: o?.version ?? null, courier: !!pick('overseer-courier@overseer') };
+}
+
+function subagentsOf(a) {
+  pruneSubagents();
+  const mirror = readJson(sub('subagents', a.sessionId, 'agents.json'));
+  if (mirror?.overseer) return { mirror };
+  if (!overseerInfo().installed) refuse(`Overseer is not installed on this computer, so subagents can't be watched or steered. To add it: ${OVERSEER_INSTALL}. Sessions started after that have it.`);
+  return { mirror: undefined, note: 'No subagents seen in this session. Overseer is installed, but a session opened before it or before Clawd 0.8.0 reports none until it is restarted.' };
+}
+
+// a session's copy is kept a week after it was last written, so the bot can still read an ended session's subagents
+function pruneSubagents() {
+  let names = [];
+  try { names = fs.readdirSync(sub('subagents')); } catch { return; }
+  for (const n of names) {
+    const st = fs.statSync(sub('subagents', n, 'agents.json'), { throwIfNoEntry: false });
+    if (st && Date.now() - st.mtimeMs > SUBAGENT_KEEP_MS) fs.rmSync(sub('subagents', n), { recursive: true, force: true });
+  }
+}
+
+// what the bot set for subagents lasts while it has the session: a paused one goes on when it is released
+function clearSubagentSteer(sessionId) {
+  const d = sub('subagents', sessionId);
+  let names = [];
+  try { names = fs.readdirSync(d); } catch { return; }
+  for (const n of names) if (n === 'steer.json' || /^(pause|stop)-/.test(n)) fs.rmSync(path.join(d, n), { force: true });
+}
+
+// what the bot set for a session's subagents: model and effort, and the pause and stop marks the mod acts on
+function steerOf(sessionId) {
+  const d = sub('subagents', sessionId);
+  let marks = [];
+  try { marks = fs.readdirSync(d); } catch {}
+  return { runs: readJson(path.join(d, 'steer.json')) ?? {}, marks: new Set(marks) };
+}
+
+const fileSafe = (id) => String(id).replace(/[^\w.-]/g, '_');
+
+// for sessions: how many subagents Overseer has seen, and how many still work
+function subagentCount(sessionId) {
+  const agents = readJson(sub('subagents', sessionId, 'agents.json'))?.agents;
+  if (!agents?.length) return undefined;
+  return { running: agents.filter((x) => ['starting', 'review', 'running', 'paused'].includes(x.status)).length, total: agents.length };
+}
+
+function subagentWho(s) {
+  return `subagent "${s?.name ?? s?.id}" (${[s?.kind, s?.model].filter(Boolean).join(', ')})`;
+}
+
+function subagentSummary(x, steer) {
+  const mark = fileSafe(x.id);
+  const active = ['starting', 'review', 'running', 'paused'].includes(x.status);
+  const held = steer.marks.has(`holding-${mark}`);
+  const last = Math.max(x.startedAt ?? 0, x.endedAt ?? 0, ...(x.thread ?? []).map((m) => m.at ?? 0));
+  const runs = steer.runs[x.id];
+  const next = { ...(x.override?.model && { model: x.override.model }), ...(x.override?.effort && { effort: x.override.effort }), ...(runs?.model && { model: runs.model }), ...(runs?.effort && { effort: runs.effort }) };
+  return {
+    id: x.id,
+    name: x.name,
+    kind: x.kind,
+    type: x.type,
+    model: x.model ?? null,
+    effort: x.effort ?? null,
+    status: active && held ? 'paused' : x.status,
+    steps: x.steps ?? 0,
+    tokens: { in: x.tokensIn ?? 0, out: x.tokensOut ?? 0 },
+    lastActivityAt: last ? new Date(last).toISOString() : null,
+    activity: x.activity || undefined,
+    startedAt: x.startedAt ? new Date(x.startedAt).toISOString() : undefined,
+    endedAt: x.endedAt ? new Date(x.endedAt).toISOString() : undefined,
+    parentId: x.parentId,
+    error: x.error,
+    ...(Object.keys(next).length && { next }),
+    ...(steer.marks.has(`pause-${mark}`) && { pausedByBot: true }),
+    ...((steer.marks.has(`stop-${mark}`) || x.isStopping) && { stopping: true }),
+    ...(x.isPaused && { pausedInPane: true }),
+    ...(x.kind === 'codex' && x.codex && { codex: { threadId: x.codex.threadId, running: !!x.codex.turnId, alive: x.codex.isAlive } }),
+  };
+}
+
+function findSubagent(mirror, ref) {
+  if (!ref) refuse('Name a subagent: its id, the start of its id, or its name.');
+  const list = mirror?.agents ?? [];
+  const r = String(ref).toLowerCase();
+  const exact = list.filter((x) => x.id === ref || x.name?.toLowerCase() === r);
+  const loose = exact.length ? exact : list.filter((x) => (r.length >= 4 && x.id.toLowerCase().startsWith(r)) || x.name?.toLowerCase().includes(r));
+  if (loose.length === 1) return loose[0];
+  if (loose.length > 1) refuse(`"${ref}" matches ${loose.length} subagents: ${loose.map((x) => `${x.name} (${x.id})`).join(', ')}. Be more specific.`);
+  refuse(`No subagent matches "${ref}" in this session. List them with clawdctl subagents.`);
+}
 
 // ---------- the session's screen ----------
 //
@@ -990,7 +1140,7 @@ function extras(e) {
 
 function line(e) {
   const who = `[${machine()}] ${e.name ?? path.basename(e.cwd ?? '') ?? e.sessionId?.slice(0, 8)}`;
-  if (e.kind === 'ask' && e.ask === 'permission') return `${who} wants permission for ${e.tool}: ${clip(e.summary, 600)} (ask ${e.askId}, mode ${e.mode})`;
+  if (e.kind === 'ask' && e.ask === 'permission') return `${who}${e.subagent ? ` (subagent ${e.subagentName ?? e.subagent})` : ''} wants permission for ${e.tool}: ${clip(e.summary, 600)} (ask ${e.askId}, mode ${e.mode})`;
   if (e.kind === 'context') return `${who} has used ${e.contextPercent}% of its context; it will compact soon.`;
   if (e.kind === 'ask') return `${who} asks: ${(e.questions ?? []).map((q) => `${q.question} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`).join(' ')} (ask ${e.askId}, mode ${e.mode})`;
   if (e.kind === 'turn_done' && e.reason === 'aborted') return `${who} was interrupted. It had got to: ${clip(e.answer, 300)}`;
@@ -999,6 +1149,9 @@ function line(e) {
   if (e.kind === 'released') return `${who} is back with the person at the machine. Its asks show there again.`;
   if (e.kind === 'test') return `[${machine()}] Clawd Bot is connected.`;
   if (e.kind === 'ended') return `${who} ended.`;
+  if (e.kind === 'steer_failed' && e.subagent) return `${who} ${subagentWho(e.subagent)} could not run on ${[e.model, e.effort].filter(Boolean).join(' ')}; it went back to its own model and effort.`;
+  if (e.kind === 'subagent' && e.state === 'stuck') return `${who} ${subagentWho(e.subagent)} looks stuck: ${e.reason}. clawdctl subagent ${e.sessionId?.slice(0, 8)} ${e.subagent?.id} shows its thread.`;
+  if (e.kind === 'subagent') return `${who} ${subagentWho(e.subagent)} ${e.state === 'failed' ? `failed${e.error ? ` (${clip(e.error, 200)})` : ''}` : e.state === 'stopped' ? 'was stopped' : 'finished'} after ${e.subagent?.steps ?? 0} steps${e.answer ? `: ${clip(e.answer, 300)}` : '.'}`;
   if (e.kind === 'steer_failed') return `${who} could not run on ${[e.model, e.effort].filter(Boolean).join(' ')}; it went back to its own model and effort.`;
   if (e.kind === 'failed') return `${who} failed (${e.reason}): ${clip(e.answer, 300)}`;
   if (e.kind === 'request') return `${who} asks Grok Bot (request ${e.requestId}): ${clip(e.task, 600)}`;
@@ -1098,6 +1251,10 @@ const TOOLS = [
   ['set_permissions', 'Set how a taken-over session handles permission prompts while you have it: acceptEdits allows file edits inside its folder without asking, dontAsk denies anything not pre-approved, default goes back to asking you.', { session: S, permissions: { ...S, enum: ['default', 'acceptEdits', 'dontAsk'] } }, ['session', 'permissions'], 'set_permissions'],
   ['set_report', 'Push a short progress report for a taken-over session every N minutes, or "off".', { session: S, minutes: S }, ['session', 'minutes'], 'set_report'],
   ['peek', 'The last messages of a session and its state, to summarise it for the person.', { session: S, count: { type: 'number' } }, ['session'], 'peek'],
+  ['list_subagents', 'The subagents a session started, Claude and Codex alike, as Overseer sees them: id, name, kind (claude or codex), model, effort, status, steps, tokens and last activity. Needs Overseer on the machine.', { session: S }, ['session'], 'subagents'],
+  ['read_subagent', 'One subagent of a session: the prompt its parent gave it and its recent thread (count entries, up to 40).', { session: S, subagent: { ...S, description: 'Its id, the start of its id, or its name.' }, count: { type: 'number' } }, ['session', 'subagent'], 'read_subagent'],
+  ['message_subagent', 'Send a subagent of a taken-over session a message, as the person. A running one reads it at its next step (a Codex one in the turn it runs); a finished one picks up again under the same id, with its history.', { session: S, subagent: S, text: S }, ['session', 'subagent', 'text'], 'message_subagent'],
+  ['steer_subagent', 'Steer a subagent of a taken-over session: model or effort (value; "default" for its own) from its next request, pause or resume (Claude subagents) before their next request, or stop it (a Codex one stops its turn).', { session: S, subagent: S, action: { ...S, enum: ['model', 'effort', 'pause', 'resume', 'stop'] }, value: S }, ['session', 'subagent', 'action'], 'steer_subagent'],
   ['read_screen', 'The dialog or panel a session shows in its terminal (/usage, /cost, /status, a model picker), as text: status "waiting: dialog open" means one is up. dismiss true sends Escape afterwards, only while a dialog is open. full true returns the whole screen.', { session: S, dismiss: { type: 'boolean' }, full: { type: 'boolean' } }, ['session'], 'screen'],
   ['plan_usage', 'The Claude plan limits on this machine\'s account as /usage shows them: each window (session, week, a model\'s week) with percent used and when it resets. Uses a reading under 5 minutes old; fresh true reads /usage again (a throwaway session, no model request).', { fresh: { type: 'boolean' }, folder: S }, [], 'usage'],
   ['stop_session', 'Stop a background session. Its conversation is kept and can be resumed.', { session: S }, ['session'], 'stop'],
@@ -1258,6 +1415,9 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
   clawdctl permissions <session> default|acceptEdits|dontAsk
   clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
+  clawdctl subagents <session>                     its subagents (Claude and Codex), as Overseer sees them
+  clawdctl subagent <session> <id> [--count n]     a subagent's prompt and recent thread
+  clawdctl subagent <session> <id> send <text> | model <m> | effort <e> | pause | resume | stop
   clawdctl screen <session> [--dismiss] [--full]   the dialog or panel the session shows; --dismiss sends Escape after
   clawdctl usage [--fresh] [--folder <dir>]        plan limits as /usage shows them (session, weekly, resets)
   clawdctl remote <session> | budget <session> <usd|off> | ci-wake <session> on|off | file <path>
@@ -1295,6 +1455,8 @@ async function main() {
       case 'permissions': return commands.set_permissions({ session: pos[0], permissions: pos[1] });
       case 'report': return commands.set_report({ session: pos[0], minutes: pos[1] });
       case 'peek': return commands.peek({ session: pos[0], count: flags.count });
+      case 'subagents': return commands.subagents({ session: pos[0] });
+      case 'subagent': return await commands.subagent({ session: pos[0], agent: pos[1], op: pos[2] === 'send' ? 'message' : pos[2], value: pos.length > 3 ? pos.slice(3).join(' ') : undefined, count: flags.count });
       case 'screen': return await commands.screen({ session: pos[0], dismiss: flags.dismiss, full: flags.full });
       case 'usage': return await commands.usage({ fresh: flags.fresh, folder: flags.folder });
       case 'dialog-check': return await commands.dialog_check(flags);

@@ -8,6 +8,9 @@ const CONTROL = `${HOME}/.clawd/control/${SESSION}.json`
 
 type Wait = (script: string) => { exitCode: number; stdout?: string }
 
+// what `ps -A -o args=` lists, for the Codex bridge lookup
+let psOutput = ''
+
 // The engine beneath the mod: an in-memory disk, a session, and the shell calls the mod makes.
 function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string[] = ['terminal'], logs: string[] = [], ran: string[][] = []) {
   const run = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -41,6 +44,7 @@ function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string
       const r = wait(args[1] ?? '')
       return run(r.exitCode, r.stdout ?? '')
     }
+    if (cmd === 'ps') return run(0, psOutput)
     if (cmd === 'rm') {
       for (const f of args.filter(a => a !== '-f')) files.delete(f)
       return run(0)
@@ -464,4 +468,160 @@ test('every session keeps the newest plan limits for clawdctl usage', async ($, 
   const kept = JSON.parse(files.get(`${HOME}/.clawd/usage.json`)!) as { sessionId: string; rateLimits: unknown[] }
   expect(kept.sessionId).toBe(SESSION)
   expect(kept.rateLimits).toEqual(rateLimits)
+})
+
+// ---------- subagents, through Overseer ----------
+
+declare const setTimeout: (f: () => void, ms: number) => unknown
+const settle = () => new Promise<void>(r => setTimeout(r, 30))
+const SUB = `${HOME}/.clawd/subagents/${SESSION}`
+
+// a stand-in for Overseer: it writes its own `agents` state, as Overseer does on every change. It runs in its own
+// environment, so the agents come in as the command's arguments.
+const overseer = {
+  name: 'overseer',
+  register: (on: On) => {
+    on('command.run', { command: 'overseer-write' }, async ($, e) => {
+      await $.state.set({ plugin: 'overseer', key: 'agents' } as never, JSON.parse(e.args) as never)
+      return { text: 'ok' }
+    })
+  },
+}
+const overseerWrites = async ($: { command: { run: (a: never) => Promise<unknown> } }, agents: Record<string, unknown>) => {
+  await $.command.run(typed('overseer-write', JSON.stringify(agents)) as never)
+  await settle()
+}
+const agent = (id: string, fields: object = {}) => ({
+  id, kind: 'claude', name: id, type: 'general-purpose', description: 'd', status: 'running', startedAt: 1, spawnPrompt: 'Count to 15.',
+  steps: 1, tokensIn: 10, tokensOut: 5, activity: 'Bash: echo 1', thread: [{ id: 'm1', at: 1, by: 'parent', text: 'Count to 15.' }], ...fields,
+})
+const done = (id: string, answer: string, fields: object = {}) =>
+  agent(id, { status: 'completed', endedAt: 2, thread: [{ id: 'm1', at: 1, by: 'parent', text: 'Count to 15.' }, { id: 'm2', at: 2, by: 'agent', text: answer }], ...fields })
+const subagentEvents = (files: Map<string, string>) => outbox(files).filter(e => e.kind === 'subagent') as unknown as { state: string; subagent: { id: string }; answer?: string; reason?: string }[]
+
+test('every session copies Overseer\'s subagents for clawdctl; an end reaches the bot only while it holds the session', { plugins: [overseer] }, async ($, on) => {
+  const files = new Map<string, string>()
+  engine(on, files, noWait)
+  on('command.run', () => ({ text: undefined }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  await overseerWrites($, { a1: agent('a1') })
+  const copy = JSON.parse(files.get(`${SUB}/agents.json`)!) as { overseer: boolean; agents: { id: string; status: string; spawnPrompt: string }[] }
+  expect(copy.overseer).toBe(true)
+  expect(copy.agents.map(a => [a.id, a.status, a.spawnPrompt])).toEqual([['a1', 'running', 'Count to 15.']])
+  await overseerWrites($, { a1: done('a1', 'COUNTED') })
+  expect(subagentEvents(files)).toEqual([])
+
+  files.set(CONTROL, takenOver())
+  await $.command.run(typed('clawd', 'handle'))
+  await overseerWrites($, { a1: done('a1', 'COUNTED'), a2: agent('a2', { kind: 'codex' }) })
+  await overseerWrites($, { a1: done('a1', 'COUNTED'), a2: done('a2', 'CODEXDONE', { kind: 'codex' }) })
+  expect(subagentEvents(files).map(e => [e.state, e.subagent.id, e.answer])).toEqual([['finished', 'a2', 'CODEXDONE']])
+
+  // writes inside a second are folded, and the next tick writes the copy
+  await $.command.run(typed('clawd', 'handle'))
+  expect((JSON.parse(files.get(`${SUB}/agents.json`)!) as { agents: unknown[] }).agents.length).toBe(2)
+})
+
+test('a subagent\'s requests take what the bot set: model and effort, a pause that holds, a stop that ends it', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()], [`${SUB}/steer.json`, JSON.stringify({ a1: { model: 'haiku', effort: 'low' } })]])
+  const scripts: string[] = []
+  engine(on, files, script => {
+    scripts.push(script)
+    return { exitCode: 0 }
+  })
+  on('command.run', () => ({ text: undefined }))
+  const seen: unknown[] = []
+  on('turn.step', async function* (_, e) {
+    seen.push([e.agentId, e.model, e.effort])
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await $.command.run(typed('clawd', 'handle'))
+  const step = (agentId: string) => ({ turnId: 't1', index: 0, model: 'sonnet', effort: 'high' as const, messageCount: 1, agentId })
+  const run = async (agentId: string) => {
+    const gen = $.turn.step(step(agentId))
+    for (;;) {
+      const r = await gen.next()
+      if (r.done) return r.value
+    }
+  }
+
+  await run('a1')
+  await run('a2')
+  expect(seen).toEqual([['a1', 'haiku', 'low'], ['a2', 'sonnet', 'high']])
+
+  files.set(`${SUB}/pause-a1`, '1')
+  await run('a1')
+  expect(scripts.some(s => s.includes(`${SUB}/pause-a1`))).toBe(true)
+  expect(files.has(`${SUB}/holding-a1`)).toBe(false)
+
+  files.set(`${SUB}/stop-a1`, '1')
+  const stopped = await run('a1')
+  expect(stopped.answer).toBe('Stopped by the person through Clawd Bot.')
+  expect(seen.length).toBe(3)
+  expect(files.has(`${SUB}/stop-a1`)).toBe(false)
+})
+
+test('the bot\'s message goes to a Claude subagent by session.send, to a finished Codex one by Overseer\'s Codex tool, and into a running Codex turn through its bridge', { plugins: [overseer] }, async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()], ['/tmp/ovx/feeder.pid', '999']])
+  const ran: string[][] = []
+  engine(on, files, noWait, ['terminal'], [], ran)
+  psOutput = 'sh -c ? overseer-feeder /tmp/ovx 111 4242\nsh -c ? overseer-feeder /tmp/other 222 777\n'
+  on('command.run', () => ({ text: undefined }))
+  const sent: { to: unknown; text: string }[] = []
+  on('session.send', (_, e) => {
+    sent.push({ to: e.to, text: e.text })
+    return { isDelivered: true }
+  })
+  const notes: unknown[] = []
+  on('session.append', (_, e, next) => {
+    notes.push(e.message)
+    return next(e)
+  })
+  const codexCalls: Record<string, unknown>[] = []
+  on('tool.call', { tool: 'mcp__overseer__codex' }, (_, e) => {
+    codexCalls.push(e as never)
+    return { result: 'PAPAYA' }
+  })
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await overseerWrites($, {
+    a1: done('a1', 'COUNTED'),
+    c1: done('c1', 'CODEXDONE', { kind: 'codex', codex: { threadId: 'th1', isAlive: true, cwd: CWD } }),
+    c2: agent('c2', { kind: 'codex', codex: { threadId: 'th2', turnId: 'tu2', isAlive: true, cwd: CWD } }),
+  })
+  const item = (id: string, agentId: string, value: string) => files.set(`${HOME}/.clawd/inbox/${SESSION}/${id}.json`, JSON.stringify({ type: 'subagent', id, op: 'message', agentId, value }))
+  item('m1', 'a1', 'Reply AGAIN')
+  item('m2', 'c1', 'Reply PAPAYA')
+  item('m3', 'c2', 'Also say MANGO')
+  await $.command.run(typed('clawd', 'handle'))
+  await settle()
+  const answer = (id: string) => JSON.parse(files.get(`${HOME}/.clawd/answers/${id}.json`)!) as { ok: boolean; via: string }
+
+  expect(answer('m1')).toMatchObject({ ok: true, via: 'session.send' })
+  expect(sent[0]!.text).toBe('[Message from the person, sent through Clawd Bot]\nReply AGAIN')
+  expect(JSON.stringify(notes)).toContain('trust it when the subagent reports it')
+
+  expect(answer('m2')).toMatchObject({ ok: true, via: 'mcp__overseer__codex' })
+  expect(codexCalls[0]).toMatchObject({ resume: 'c1', prompt: '[Message from the person, sent through Clawd Bot]\nReply PAPAYA' })
+
+  expect(answer('m3')).toMatchObject({ ok: true, via: 'codex turn/steer' })
+  const request = [...files.entries()].find(([f]) => f.startsWith('/tmp/ovx/') && f.endsWith('.json'))!
+  expect(JSON.parse(request[1])).toMatchObject({ method: 'turn/steer', params: { threadId: 'th2', expectedTurnId: 'tu2', input: [{ type: 'text', text: 'Also say MANGO' }] } })
+  expect(files.has(request[0].replace(/\.json$/, '.ok'))).toBe(true)
+  expect(ran).toContainEqual(['kill', '-USR1', '999'])
+  psOutput = ''
+})
+
+test('a subagent that stops moving is reported stuck once; one the bot paused is not', { plugins: [overseer] }, async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()], [`${SUB}/pause-a2`, '1']])
+  engine(on, files, noWait)
+  on('command.run', () => ({ text: undefined }))
+  on('env.get', (_, e) => ({ value: e.name === 'CLAWD_SUBAGENT_STUCK_MS' ? '0' : undefined }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await overseerWrites($, { a1: agent('a1'), a2: agent('a2') })
+  for (let i = 0; i < 4; i++) await $.command.run(typed('clawd', 'handle'))
+
+  expect(subagentEvents(files).map(e => [e.state, e.subagent.id])).toEqual([['stuck', 'a1']])
+  expect(subagentEvents(files)[0]!.reason).toContain('no new step')
 })

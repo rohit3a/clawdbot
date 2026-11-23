@@ -19,7 +19,8 @@ Everything runs on your machines and over links you already have. There is no se
 - Read its last messages, and stop a background session.
 - Read a dialog or panel left open on its screen (/usage, /cost, /status, a model picker), and close it with Escape.
 - Show the Claude plan's limits as /usage does: the current session and the week, how much of each is used and when each resets.
-- Push events to the bot: asks, finished turns, interruptions and failures, a session stuck at a dialog with the dialog's text, plus a progress report at an interval you choose.
+- With [Overseer](#subagents) installed, list a session's Claude and Codex subagents, read each one's prompt and thread, and message, pause, resume, stop or re-model them.
+- Push events to the bot: asks, finished turns, interruptions and failures, a session stuck at a dialog with the dialog's text, subagents that finish, fail or stall, plus a progress report at an interval you choose.
 - With each finished turn, pass on what it made: links (PRs, previews), media files (images, GIFs, videos, PDFs) the bot can fetch and post, the turn's commits and changed files, the PR and its checks, and the session's cost.
 - Turn on Remote Control when it takes over a terminal session, and send the bot the link.
 - Watch a PR's checks after a turn. When CI fails, the bot hears about it and the session is woken to fix it.
@@ -126,6 +127,8 @@ clawdctl send <session> <text> | interrupt <session> | model <session> <m> | eff
 clawdctl permissions <session> default|acceptEdits|dontAsk
 clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
 clawdctl screen <session> [--dismiss] [--full] | usage [--fresh] [--folder <dir>]
+clawdctl subagents <session> | subagent <session> <id> [--count n]
+clawdctl subagent <session> <id> send <text> | model <m> | effort <e> | pause | resume | stop
 clawdctl remote <session> | budget <session> <usd|off> | ci-wake <session> on|off | file <path>
 clawdctl grok <session> on|off [--per-hour n] | requests | reply <request> --text <t> | --decline <why>
 clawdctl schedule --at <21:30|+90m|ISO> --folder <dir> --prompt <text> [--name n] [--model m] [--effort e] [--mode m]
@@ -182,6 +185,52 @@ clawdctl usage
 
 A reading under 5 minutes old is used as it is: the last panel read, or the limits a session on the computer saw in its last API response (`source: "session"`). Otherwise, or with `--fresh`, clawdctl opens /usage in a throwaway background session in your home folder, reads it, and stops and removes the session, in about 10 seconds. That sends no prompt to the model, so it uses none of the plan. The folder must be trusted: `--folder <dir>` or `clawdctl config usage-folder <dir>` names another one.
 
+### Subagents
+
+Subagent control works through [Overseer](https://github.com/rohit3a/overseer) 0.3.0 or later, which tracks every Claude subagent (the Agent tool) and Codex agent (its `codex` tool) a session starts. Install it on the same computer:
+
+```bash
+claude plugin marketplace add rohit3a/overseer
+```
+
+```bash
+claude plugin install overseer@overseer
+```
+
+```bash
+claude plugin install overseer-courier@overseer
+```
+
+The courier lets you message subagents from Overseer's own pane; Clawd does not need it. Without Overseer, `subagents` says so and names these commands. A session picks Overseer up when it next starts.
+
+```bash
+clawdctl subagents api-fix
+```
+
+```json
+{ "session": "…", "name": "api-fix", "overseer": { "installed": true, "version": "0.3.0", "courier": true },
+  "subagents": [
+    { "id": "a8d1…", "name": "counter", "kind": "claude", "model": "claude-haiku-5-5", "effort": "low", "status": "running",
+      "steps": 16, "tokens": { "in": 41200, "out": 980 }, "activity": "Bash: echo 15", "lastActivityAt": "2026-11-23T12:43:21.000Z" },
+    { "id": "codex-mwt9…", "name": "codexsleeper", "kind": "codex", "model": "gpt-6.1-terra", "effort": "xhigh", "status": "completed",
+      "steps": 1, "codex": { "threadId": "…", "running": false, "alive": true } } ] }
+```
+
+`subagent <session> <id>` adds the prompt it was given and its last 12 thread entries (`--count` up to 40). A subagent is named by its id, the start of its id, or its name.
+
+Steering a subagent needs the session taken over, like steering the session itself:
+
+| Command | Claude subagent | Codex agent |
+| --- | --- | --- |
+| `send <text>` | running: arrives with its next request. Finished: wakes it under the same id, with its history | running: joins the current turn. Finished: continues the same Codex thread, through Overseer's own `codex` tool |
+| `model <m>`, `effort <e>` | from its next request | the running turn at once; a finished one at the bot's next message |
+| `pause`, `resume` | holds before its next request until resumed, stopped or released | not offered |
+| `stop` | ends at its next request | stops the running turn |
+
+Each command answers with what was done and how (`via`). A message from the bot reaches the subagent marked as the person's, and the parent session is told in a line of its own, so it trusts the subagent's report of it.
+
+A session the bot holds sends a `subagent` event when one of its subagents finishes (with its answer), fails, is stopped, or makes no new step for 10 minutes. Overseer's pane shows none of the bot's pauses or overrides; `subagents` does (`next`, `pausedByBot`, `stopping`).
+
 ## How it works
 
 The mod and clawdctl share files in `~/.clawd`:
@@ -192,6 +241,9 @@ The mod and clawdctl share files in `~/.clawd`:
 - `outbox/` holds events waiting to be pushed.
 - `screen/<session>.json` is a taken-over session's own account of itself at its last slash command, for a terminal clawdctl cannot read.
 - `usage.json` holds the plan limits from the newest API response of any session on the computer.
+- `subagents/<session>/` holds `agents.json`, the session's copy of Overseer's subagent list, and, while the bot has the session, `steer.json` (model and effort it set per subagent) and `pause-<id>` and `stop-<id>` markers. Release removes all but `agents.json`.
+
+`CLAWD_HOME` moves `~/.clawd` elsewhere, for clawdctl and the mod alike.
 
 An idle session reads only its own control file, every two seconds, and writes `usage.json` when its plan limits move. A taken-over session holds each ask at the point Claude would show it, waits for an answer file, and lets go the moment the session is released. Model, effort and permission-mode changes apply while the bot has the session, at each request and each permission check, so no confirmation dialog opens on a screen nobody is watching and your own default mode is left alone. Sessions that `clawdctl start` launches take a claim for their folder in their first turn, so even their first prompt is covered.
 
@@ -206,6 +258,7 @@ An idle session reads only its own control file, every two seconds, and writes `
 - The cost and the budget need a host that keeps a cost ledger. The terminal always has one.
 - On Linux, scheduled tasks are systemd user timers, and a reboot clears them. On macOS they survive a reboot and run at wake if the Mac slept through them.
 - A session waits up to 20 minutes for an AskGrok answer. After that the answer arrives as a message.
+- Subagents need Overseer. A Claude subagent the bot's own message woke runs outside the mod's sight until it finishes: model, effort, pause and stop do not reach that run. Codex agents can't be paused.
 
 ## Tests and releases
 
