@@ -4,8 +4,11 @@ type $ = EngineInterface
 
 type Mode = 'handle' | 'babysit'
 type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-type Permissions = 'acceptEdits' | 'dontAsk'
+type Permissions = 'acceptEdits' | 'dontAsk' | 'bypass'
 type Control = { takenOver: boolean; mode: Mode; by: 'bot' | 'you'; since: number; reportEveryMin?: number; model?: string; effort?: Effort; permissions?: Permissions; budgetUsd?: number; ciWake?: boolean }
+// what the bot set for the session itself: kept in runs/<session>.json, which outlives a release, until the bot sets
+// "default" or the person types /clawd clear
+type Runs = { model?: string; effort?: Effort; permissions?: Permissions }
 type SubagentOp = 'message' | 'model' | 'effort' | 'pause' | 'resume' | 'stop'
 type SubagentSteer = { type: 'subagent'; id: string; op: SubagentOp; agentId: string; value?: string }
 type Steer = { type: 'message'; text: string } | { type: 'interrupt' } | { type: 'remote' } | SubagentSteer
@@ -68,6 +71,7 @@ let home: string | undefined
 let sessionId: string | undefined
 let cwd = ''
 let control: Control | undefined
+let runs: Runs = {}
 // what the bot was last told about this session; hooks refresh control, only tick moves this
 let announced: Control | undefined
 let busy = false
@@ -166,6 +170,22 @@ async function readControl($: $): Promise<Control | undefined> {
   return c?.takenOver ? c : undefined
 }
 
+// the bot's settings for this session, held or not. A session given to the bot before 1.0.0 (or by /clawd on, which
+// copies them) may carry them in its control file only, which counts while it is held.
+async function readRuns($: $, c: Control | undefined): Promise<Runs> {
+  const kept = await readJson<Runs>($, `${await dir($)}/runs/${await myId($)}.json`)
+  const r = kept ?? (c ? { model: c.model, effort: c.effort, permissions: c.permissions } : {})
+  return { ...(r.model && { model: r.model }), ...(r.effort && { effort: r.effort }), ...(r.permissions && { permissions: r.permissions }) }
+}
+
+async function writeRuns($: $, next: Runs): Promise<void> {
+  const path = `${await dir($)}/runs/${await myId($)}.json`
+  if (!next.model && !next.effort && !next.permissions) await removeFiles($, [path])
+  else await $.fs.write(path, JSON.stringify(next, null, 2))
+}
+
+const sameRuns = (a: Runs, b: Runs) => a.model === b.model && a.effort === b.effort && a.permissions === b.permissions
+
 function newId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 }
@@ -207,22 +227,26 @@ async function removeFiles($: $, paths: string[]): Promise<void> {
 }
 
 function showStatus($: $): void {
-  if (!control) return $.ui.status(undefined)
+  const set = [runs.model, runs.effort, runs.permissions].filter(Boolean).join(' ')
+  if (!control) return $.ui.status(set ? `Clawd Bot's settings stay · ${set} · /clawd clear goes back to your own` : undefined)
   const mode = control.mode === 'babysit' ? 'babysit' : 'handle it'
-  const runs = [control.model, control.effort, control.permissions].filter(Boolean).join(' ')
-  $.ui.status(`Clawd Bot has this session · ${holding ? `waiting on ${holding}` : mode}${runs ? ` · ${runs}` : ''}`)
+  $.ui.status(`Clawd Bot has this session · ${holding ? `waiting on ${holding}` : mode}${set ? ` · ${set}` : ''}`)
 }
 
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 
-// the bot's permission mode for this session, applied where Claude would ask; the user's own default mode is left alone
-function byPermissions(c: Control, tool: string, input: unknown): { decision: 'allow' | 'deny'; reason: string } | undefined {
-  if (c.permissions === 'dontAsk') return { decision: 'deny', reason: 'Not pre-approved, and Clawd Bot set this session to not ask. Find another way or say what you need.' }
-  if (c.permissions !== 'acceptEdits' || !EDIT_TOOLS.has(tool)) return undefined
+// the bot's permission mode for this session, applied only where Claude would ask, so the settings' own allows and
+// denies (and floors such as Permit's, which deny) stand; the user's own default mode is left alone. An allow never
+// goes past the organization's ceiling for the call.
+function byPermissions(r: Runs, tool: string, input: unknown, ceiling: string | undefined): { decision: 'allow' | 'deny'; reason: string } | undefined {
+  const mayAllow = !ceiling || ceiling === 'allow'
+  if (r.permissions === 'dontAsk') return { decision: 'deny', reason: 'Not pre-approved, and Clawd Bot set this session to not ask. Find another way or say what you need.' }
+  if (r.permissions === 'bypass') return mayAllow ? { decision: 'allow', reason: 'Clawd Bot set this session to bypass permission prompts.' } : undefined
+  if (r.permissions !== 'acceptEdits' || !EDIT_TOOLS.has(tool) || !mayAllow) return undefined
   const i = (input ?? {}) as Record<string, unknown>
   const file = typeof i.file_path === 'string' ? i.file_path : typeof i.notebook_path === 'string' ? i.notebook_path : ''
   const inside = cwd !== '' && file.startsWith(`${cwd.replace(/\/+$/, '')}/`) && !file.includes('/../')
-  return inside ? { decision: 'allow', reason: 'Edits in this folder are accepted while Clawd Bot has the session.' } : undefined
+  return inside ? { decision: 'allow', reason: 'Clawd Bot set this session to accept edits in its folder.' } : undefined
 }
 
 function summarize(tool: string, input: unknown): string {
@@ -780,7 +804,9 @@ function tick($: $): Promise<void> {
 
 async function tickOnce($: $): Promise<void> {
   const was = announced
+  const wasRuns = runs
   control = await readControl($)
+  runs = await readRuns($, control)
   announced = control
   if (!overseerChecked) await lookForOverseer($).catch(() => undefined)
   if (mirrorDue) await writeMirror($).catch(() => undefined)
@@ -803,7 +829,7 @@ async function tickOnce($: $): Promise<void> {
     await removeFiles($, [`${await dir($)}/live/${await myId($)}.json`])
     await emit($, 'released', {})
     return
-  } else if (control && (was?.mode !== control.mode || was?.model !== control.model || was?.effort !== control.effort || was?.permissions !== control.permissions)) showStatus($)
+  } else if (!sameRuns(wasRuns, runs) || (control && was?.mode !== control.mode)) showStatus($)
   // a late answer from Grok Bot arrives in the inbox even when nobody has taken the session over
   if (!control) {
     if (grok) await drainInbox($)
@@ -860,8 +886,8 @@ export const register: Register = on => {
     $.clock.every(TICK_MS, () => void tick($).then(() => remoteOn($)).catch(() => undefined))
     await $.command.register({
       name: 'clawd',
-      description: 'Hand this session to your bot, or take it back: on, off, babysit, handle, status; grok on|off lets it ask Grok Bot',
-      argumentHint: 'on | off | babysit | handle | status | grok on | grok off',
+      description: 'Hand this session to your bot, or take it back: on, off, babysit, handle, status; clear drops the bot model, effort and permission mode; grok on|off lets it ask Grok Bot',
+      argumentHint: 'on | off | babysit | handle | status | clear | grok on | grok off',
     })
     return next(e)
   })
@@ -903,12 +929,24 @@ export const register: Register = on => {
       return { text: `Clawd Bot has this session (${mode === 'babysit' ? 'babysit: every ask goes to you' : 'handle it: the bot decides, asks you when unsure'}). /clawd off takes it back.` }
     }
     if (word === 'off') {
+      // what the bot set stays; a control file from before 1.0.0 is its only record of it
+      const kept = await readRuns($, now)
+      if (now) await writeRuns($, kept)
       await setClaim($, undefined)
       await tick($)
-      return { text: 'You have this session again. Questions and permissions show here.' }
+      const set = [kept.model, kept.effort, kept.permissions].filter(Boolean).join(' ')
+      return { text: `You have this session again. Questions and permissions show here.${set ? ` Clawd Bot's settings stay (${set}): /clawd clear goes back to your own.` : ''}` }
+    }
+    if (word === 'clear') {
+      await writeRuns($, {})
+      if (now) await setClaim($, { ...now, model: undefined, effort: undefined, permissions: undefined })
+      await tick($)
+      return { text: 'This session is back on its own model, effort and permission mode.' }
     }
     const id = await myId($)
-    return { text: now ? `Clawd Bot has this session ${id} (${now.mode}).` : `Clawd is idle in session ${id}. /clawd on hands it to your bot.` }
+    const set = [runs.model, runs.effort, runs.permissions].filter(Boolean).join(' ')
+    const kept = set ? ` Clawd Bot's settings: ${set} (/clawd clear drops them).` : ''
+    return { text: (now ? `Clawd Bot has this session ${id} (${now.mode}).` : `Clawd is idle in session ${id}. /clawd on hands it to your bot.`) + kept }
   })
 
   on('turn.start', async ($, e, next) => {
@@ -988,16 +1026,22 @@ export const register: Register = on => {
         }
       }
     }
+    // the bot's model and effort, held or not: they stay after a release until the bot sets "default"
+    const set = await readRuns($, c)
     let req = e
-    if (c?.model && c.model !== e.model) req = { ...req, model: c.model }
-    if (c?.effort && c.effort !== e.effort) req = { ...req, effort: c.effort as typeof e.effort }
+    if (set.model && set.model !== e.model) req = { ...req, model: set.model }
+    if (set.effort && set.effort !== e.effort) req = { ...req, effort: set.effort as typeof e.effort }
     const res = yield* next(req)
-    if (req !== e && res.stopReason === null && control) {
-      const failed = { model: control.model, effort: control.effort }
-      control = { ...control, model: undefined, effort: undefined }
-      await setClaim($, control)
+    if (req !== e && res.stopReason === null) {
+      const failed = { model: set.model, effort: set.effort }
+      runs = { ...(set.permissions && { permissions: set.permissions }) }
+      await writeRuns($, runs)
+      if (c) {
+        control = { ...c, model: undefined, effort: undefined }
+        await setClaim($, control)
+      }
       showStatus($)
-      await emit($, 'steer_failed', { ...failed, note: 'The session went back to its own model and effort.' })
+      if (c) await emit($, 'steer_failed', { ...failed, note: 'The session went back to its own model and effort.' })
     }
     return res
   })
@@ -1070,9 +1114,10 @@ export const register: Register = on => {
     }
     if (r.decision !== 'ask' || e.tool === 'AskUserQuestion' || e.tool === 'AskPerson') return r
     control = await readControl($)
-    if (!control) return r
-    const set = byPermissions(control, e.tool, e.input)
+    // the bot's permission mode stays after it lets go of the session; only the ask itself goes back to the screen
+    const set = byPermissions(await readRuns($, control), e.tool, e.input, e.ceiling)
     if (set) return set
+    if (!control) return r
     const summary = summarize(e.tool, e.input)
     const key = e.tool === 'Bash' ? `Bash:${summary}` : e.tool
     if (allowedForSession.has(key)) return { decision: 'allow', reason: 'Allowed for this session through Clawd Bot' }

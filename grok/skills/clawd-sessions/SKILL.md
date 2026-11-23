@@ -24,7 +24,7 @@ On each online computer (or the one named): `~/.local/bin/clawdctl sessions`. Re
 
 ## Take over, hand back, mode
 - "Take over X": `take-over '<X>'` (add `--mode babysit` if they say). Confirm in one line: from now on its questions and permission prompts come here, and the screen shows only a status line.
-- "Give it back", "release X": `release '<X>'`. Anything it was waiting on reappears on the computer's screen.
+- "Give it back", "release X": `release '<X>'`. Anything it was waiting on reappears on the computer's screen. Model, effort and permission mode you set stay in force (`kept` lists them): say so in the same line, and offer to set them back to `default` if the user wants the session's own.
 - "Babysit X" / "you handle X": `mode '<X>' babysit|handle`.
 - The user can also type `/clawd on`, `/clawd off`, `/clawd babysit` or `/clawd handle` in the session itself.
 
@@ -32,8 +32,8 @@ On each online computer (or the one named): `~/.local/bin/clawdctl sessions`. Re
 Steering needs the session taken over; clawdctl refuses otherwise, so offer to take it over.
 - Message: `send '<X>' '<text>'`. Pass the user's words. If you add context, keep it short and concrete. It arrives within seconds, as its next prompt or alongside the current turn.
 - Interrupt: `interrupt '<X>'`. The interrupted turn arrives as an event.
-- Model or effort: `model '<X>' <m>`, `effort '<X>' <level>`; `default` undoes it. They apply from the next request while you have the session; released, it goes back to its own.
-- Permission mode: `permissions '<X>' acceptEdits` lets it edit files inside its folder without asking; `dontAsk` denies anything not already allowed, without asking; `default` goes back to asking. It lasts while you have the session. Plan, auto and bypass modes are set at the computer, not from here.
+- Model or effort: `model '<X>' <m>`, `effort '<X>' <level>`; `default` undoes it. They apply from the next request and stay after you release the session, until you set `default`, which works on a released session too. A new value needs the session taken over.
+- Permission mode: `permissions '<X>' acceptEdits` lets it edit files inside its folder without asking; `dontAsk` denies anything not already allowed, without asking; `bypass` allows everything it would ask about, with no prompt; `default` goes back to asking. Set `bypass` only when the user asks for it in so many words, and say it stays after release. The user's deny rules and the computer's safety floors still refuse under it; when a floor refuses, tell the user to answer it on their device. Each mode stays after you release the session, until you set `default` (which works on a released session) or the user types `/clawd clear` there. A released session's `keptByBot` in `sessions` shows what is still in force. Plan and auto modes are set at the computer, not from here.
 
 ## Remote Control
 A terminal session gets Remote Control when it is taken over, and the link arrives as a `remote` event. Sessions started here have it already. For another one: `remote '<X>'`. The link opens the session on the phone, the web or the Claude app.

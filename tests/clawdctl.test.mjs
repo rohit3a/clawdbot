@@ -152,11 +152,57 @@ test('model, effort and permission mode are set, checked and undone', async () =
   await clawdctl(['permissions', 'api-fix', 'acceptEdits']);
   assert.deepEqual([control().model, control().effort, control().permissions], ['haiku', 'max', 'acceptEdits']);
 
+  assert.deepEqual(read('runs', `${SESSION}.json`), { model: 'haiku', effort: 'max', permissions: 'acceptEdits' });
+
   assert.match((await clawdctl(['effort', 'api-fix', 'extreme'])).stderr, /Effort is one of/);
-  assert.match((await clawdctl(['permissions', 'api-fix', 'bypassPermissions'])).stderr, /not offered/);
+  for (const mode of ['bypassPermissions', 'plan', 'auto']) assert.match((await clawdctl(['permissions', 'api-fix', mode])).stderr, /plan and auto are not offered/, mode);
+  const bypass = await clawdctl(['permissions', 'api-fix', 'bypass']);
+  assert.equal(bypass.code, 0, bypass.stderr);
+  assert.equal(bypass.json.permissions, 'bypass');
+  assert.equal(control().permissions, 'bypass');
 
   for (const [cmd, value] of [['model', 'default'], ['effort', 'default'], ['permissions', 'default']]) await clawdctl([cmd, 'api-fix', value]);
   assert.deepEqual([control().model, control().effort, control().permissions, control().takenOver], [undefined, undefined, undefined, true]);
+  assert.equal(fs.existsSync(path.join(dir, 'runs', `${SESSION}.json`)), false);
+});
+
+test('what the bot set stays after release, until it sets "default"', async () => {
+  await clawdctl(['take-over', 'api-fix']);
+  await clawdctl(['model', 'api-fix', 'haiku']);
+  await clawdctl(['permissions', 'api-fix', 'bypass']);
+
+  const released = await clawdctl(['release', 'api-fix']);
+  assert.equal(released.code, 0, released.stderr);
+  assert.deepEqual(released.json.kept, { model: 'haiku', permissions: 'bypass' });
+  assert.match(released.json.note, /stays in force.*"default"/);
+  assert.deepEqual(control(), { takenOver: false });
+  assert.deepEqual(read('runs', `${SESSION}.json`), { model: 'haiku', permissions: 'bypass' });
+  const listed = (await clawdctl(['sessions'])).json.sessions.find((s) => s.session === SESSION);
+  assert.deepEqual([listed.takenOver, listed.permissions, listed.keptByBot], [false, 'bypass', { model: 'haiku', permissions: 'bypass' }]);
+
+  // a new setting needs the session again; "default" clears one without it
+  assert.match((await clawdctl(['effort', 'api-fix', 'low'])).stderr, /not taken over/);
+  const cleared = await clawdctl(['permissions', 'api-fix', 'default']);
+  assert.equal(cleared.code, 0, cleared.stderr);
+  assert.deepEqual([cleared.json.takenOver, cleared.json.permissions, cleared.json.model], [false, 'session default', 'haiku']);
+  assert.deepEqual(control(), { takenOver: false });
+
+  // taken over again, the kept model is in the control file too, for a mod older than 1.0.0
+  await clawdctl(['take-over', 'api-fix']);
+  assert.equal(control().model, 'haiku');
+  await clawdctl(['model', 'api-fix', 'default']);
+  await clawdctl(['release', 'api-fix']);
+  assert.equal(fs.existsSync(path.join(dir, 'runs', `${SESSION}.json`)), false);
+});
+
+test('a release keeps what a control file from before 1.0.0 carried', async () => {
+  fs.mkdirSync(path.join(dir, 'control'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'control', `${SESSION}.json`), JSON.stringify({ takenOver: true, mode: 'handle', by: 'bot', since: 1, effort: 'low', permissions: 'dontAsk' }));
+  const released = await clawdctl(['release', 'api-fix']);
+  assert.deepEqual(released.json.kept, { effort: 'low', permissions: 'dontAsk' });
+  assert.deepEqual(read('runs', `${SESSION}.json`), { effort: 'low', permissions: 'dontAsk' });
+  for (const [cmd, value] of [['effort', 'default'], ['permissions', 'default']]) await clawdctl([cmd, 'api-fix', value]);
+  assert.equal(fs.existsSync(path.join(dir, 'runs', `${SESSION}.json`)), false);
 });
 
 test('send and interrupt reach the session inbox', async () => {

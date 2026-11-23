@@ -15,7 +15,7 @@ Everything runs on your machines and over links you already have. There is no se
 - Start a session in a folder, already taken over, with Remote Control on. It returns a claude.ai link you can open on your phone, the web or the Claude app, plus `claude attach` and `claude --resume` commands for picking it up at the machine later.
 - Take over a running session, or release it back to you.
 - Answer its questions and permission prompts.
-- Send it a message, interrupt it, and change its model, effort or permission mode (accept edits, or don't ask).
+- Send it a message, interrupt it, and change its model, effort or permission mode (accept edits, don't ask, or bypass). What it sets stays after it hands the session back, until it sets `default`.
 - Read its last messages, and stop a background session.
 - Read a dialog or panel left open on its screen (/usage, /cost, /status, a model picker), and close it with Escape.
 - Show the Claude plan's limits as /usage does: the current session and the week, how much of each is used and when each resets.
@@ -108,8 +108,9 @@ Installs and updates get the latest release, never unreleased work on `main`: th
 | --- | --- |
 | `/clawd on` | hand this session to your bot |
 | `/clawd babysit` or `/clawd handle` | hand it over in that mode, or switch modes |
-| `/clawd off` | take it back |
-| `/clawd status` | show who has it |
+| `/clawd off` | take it back (the bot's model, effort and permission mode stay) |
+| `/clawd clear` | drop the bot's model, effort and permission mode, back to the session's own |
+| `/clawd status` | show who has it, and the bot's settings |
 | `/clawd grok on` or `/clawd grok off` | let this session ask your bot for help with its AskGrok tool, or stop it |
 
 If you take a session back while it is waiting on an answer, the question or permission prompt reappears on the screen.
@@ -124,7 +125,7 @@ clawdctl start --folder <dir> --prompt <text> [--name n] [--model m] [--effort e
 clawdctl take-over <session> [--mode handle|babysit] | release <session> | mode <session> handle|babysit
 clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --answers '<json>'
 clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
-clawdctl permissions <session> default|acceptEdits|dontAsk
+clawdctl permissions <session> default|acceptEdits|dontAsk|bypass
 clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
 clawdctl screen <session> [--dismiss] [--full] | usage [--fresh] [--folder <dir>]
 clawdctl subagents <session> | subagent <session> <id> [--count n]
@@ -231,7 +232,7 @@ Each command answers with what was done and how (`via`). Through Overseer 0.4.0 
 
 Codex changes effort in a running turn in place, but it refuses some model switches mid-turn (for example from `gpt-6.1-terra` to `gpt-6-luna`). Through Overseer 0.4.0 a refused switch stops the turn, and a new turn continues on the new model (`via: overseer turn/interrupt`). With Overseer 0.3.0 only Overseer sees Codex's answer, so the command says the change is unconfirmed. Either way, the bot's next message to that agent uses it.
 
-When the bot hands the session back, it gives back what it set through Overseer 0.4.0: pauses are resumed and model and effort go back to the agent's own. A Codex turn that already moved to a new model stays on it.
+Unlike the session's own model, effort and permission mode, what the bot sets for a subagent ends when it hands the session back. Through Overseer 0.4.0 it is given back: pauses are resumed and model and effort go back to the agent's own. A Codex turn that already moved to a new model stays on it.
 
 A session the bot holds sends a `subagent` event when one of its subagents finishes (with its answer), fails, is stopped, or makes no new step for 10 minutes. Through Overseer 0.4.0, Overseer's pane shows the bot's changes like its own. With 0.3.0 it shows none of them. Either way `subagents` shows them (`next`, `pausedByBot`, `stopping`).
 
@@ -249,14 +250,15 @@ The mod and clawdctl share files in `~/.clawd`:
 
 `CLAWD_HOME` moves `~/.clawd` elsewhere, for clawdctl and the mod alike.
 
-An idle session reads only its own control file, every two seconds, and writes `usage.json` when its plan limits move. A taken-over session holds each ask at the point Claude would show it, waits for an answer file, and lets go the moment the session is released. Model, effort and permission-mode changes apply while the bot has the session, at each request and each permission check, so no confirmation dialog opens on a screen nobody is watching and your own default mode is left alone. Sessions that `clawdctl start` launches take a claim for their folder in their first turn, so even their first prompt is covered.
+An idle session reads only its own control file, every two seconds, and writes `usage.json` when its plan limits move. A taken-over session holds each ask at the point Claude would show it, waits for an answer file, and lets go the moment the session is released. Model, effort and permission-mode changes apply at each request and each permission check, so no confirmation dialog opens on a screen nobody is watching and your own default mode is left alone. They are kept in `~/.clawd/runs/<session>.json`, which a release leaves in place, so they stay in force after the bot hands the session back. Sessions that `clawdctl start` launches take a claim for their folder in their first turn, so even their first prompt is covered.
 
 ## Limits
 
 - Linux and macOS only. Windows is not supported: scheduled tasks need launchd or systemd, and clawdctl's screen reads, `start` and its process checks assume a POSIX system. Clawd has not been tried in WSL.
 - A held ask waits as long as it takes. Your bot decides when to give up and answer.
 - Screen capture reads background sessions, and interactive ones in tmux, WezTerm, iTerm2 or Terminal. Other terminals (GNOME Terminal, a plain SSH login) get the session's own account instead of its screen.
-- Model, effort and permission mode set by the bot last while it has the session. Released, the session goes back to its own. The bot can't set plan, auto or bypass mode.
+- Model, effort and permission mode set by the bot stay after it releases the session, and the status line says so ("Clawd Bot's settings stay"). They end when the bot sets them back to `default` (which works on a released session), or when you type `/clawd clear`. Setting a new value needs the session taken over. The bot can't set plan or auto mode.
+- `bypass` allows every tool call Claude would ask you about, in the session and its subagents, with no prompt, also after a release. Your settings' deny rules still refuse, as do safety floors on the computer such as Permit's, which deny rather than ask. It never goes past an administrator's limit on a tool. It is not Claude Code's `bypassPermissions` mode: the session's own mode is left as it is, and calls Claude would allow anyway are untouched.
 - Background sessions need a trusted folder.
 - PR and CI status need the `gh` CLI signed in on the computer.
 - The cost and the budget need a host that keeps a cost ledger. The terminal always has one.

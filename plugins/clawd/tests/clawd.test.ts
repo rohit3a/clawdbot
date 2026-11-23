@@ -10,6 +10,8 @@ type Wait = (script: string) => { exitCode: number; stdout?: string }
 
 // what `ps -A -o args=` lists, for the Codex bridge lookup
 let psOutput = ''
+// what the status line showed, newest last
+const statuses: (string | undefined)[] = []
 
 // The engine beneath the mod: an in-memory disk, a session, and the shell calls the mod makes.
 function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string[] = ['terminal'], logs: string[] = [], ran: string[][] = []) {
@@ -19,7 +21,10 @@ function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string
   on('session.model', () => ({ value: 'sonnet' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('clock.every', () => ({ value: undefined }))
-  on('ui.status', () => ({ value: undefined }))
+  on('ui.status', (_, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
   on('ui.invalidate', () => ({ value: undefined }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('session.surfaces', () => ({ value: surfaces as never }))
@@ -176,7 +181,78 @@ test('dont ask denies without holding anything', async ($, on) => {
   expect(r.decision).toBe('deny')
 })
 
-test('the bot model and effort reach each request, and only while it has the session', async ($, on) => {
+const RUNS = `${HOME}/.clawd/runs/${SESSION}.json`
+
+// a safety floor such as Permit's: refuses a command outright, whatever the engine below would say
+const floor = {
+  name: 'floor',
+  register: (on: On) => {
+    on('tool.check', async ($, e, next) => {
+      const command = (e.input as { command?: string } | undefined)?.command ?? ''
+      return /push --force/.test(command) ? { decision: 'deny' as const, reason: 'Permit: a floor' } : next(e)
+    })
+  },
+}
+
+test('bypass allows what Claude would ask about; deny rules and safety floors still refuse', { plugins: [floor] }, async ($, on) => {
+  const files = new Map([
+    [CONTROL, takenOver({ permissions: 'bypass' })],
+    [RUNS, JSON.stringify({ permissions: 'bypass' })],
+  ])
+  engine(on, files, noWait)
+  // the engine's own verdict: a deny rule for rm -rf, an ask for anything else
+  on('tool.check', (_, e) => (/rm -rf/.test((e.input as { command?: string }).command ?? '') ? { decision: 'deny', reason: 'a deny rule' } : { decision: 'ask' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  const asked = await $.tool.check({ tool: 'Bash', input: { command: 'curl -X POST https://example.com' } })
+  const write = await $.tool.check({ tool: 'Write', input: { file_path: '/etc/hosts', content: 'x' } })
+  const denied = await $.tool.check({ tool: 'Bash', input: { command: 'rm -rf build' } })
+  const floored = await $.tool.check({ tool: 'Bash', input: { command: 'git push --force origin main' } })
+
+  expect([asked.decision, write.decision]).toEqual(['allow', 'allow'])
+  expect(asked.reason).toMatch(/bypass/)
+  expect(denied).toMatchObject({ decision: 'deny', reason: 'a deny rule' })
+  expect(floored).toMatchObject({ decision: 'deny', reason: 'Permit: a floor' })
+})
+
+test('the bot settings stay after it lets go, show in the status line, and /clawd clear drops them', async ($, on) => {
+  statuses.length = 0
+  const files = new Map([
+    [CONTROL, takenOver({ model: 'haiku', effort: 'low', permissions: 'bypass' })],
+    [RUNS, JSON.stringify({ model: 'haiku', effort: 'low', permissions: 'bypass' })],
+  ])
+  engine(on, files, noWait)
+  on('tool.check', () => ({ decision: 'ask' }))
+  const seen: { model: string; effort?: unknown }[] = []
+  on('turn.step', async function* (_, e) {
+    seen.push({ model: e.model, effort: e.effort })
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await $.turn.start({ turnId: 't0', text: 'go' } as never)
+  expect(statuses.at(-1)).toBe('Clawd Bot has this session · handle it · haiku low bypass')
+
+  const off = await $.command.run(typed('clawd', 'off'))
+  expect(JSON.stringify(off)).toMatch(/settings stay \(haiku low bypass\)/)
+  expect(statuses.at(-1)).toBe("Clawd Bot's settings stay · haiku low bypass · /clawd clear goes back to your own")
+
+  const step = { turnId: 't1', index: 0, model: 'sonnet', effort: 'high' as const, messageCount: 1 }
+  for await (const _ of $.turn.step(step)) void _
+  expect((await $.tool.check({ tool: 'Bash', input: { command: 'npm publish' } })).decision).toBe('allow')
+
+  await $.command.run(typed('clawd', 'clear'))
+  expect(files.has(RUNS)).toBe(false)
+  expect(statuses.at(-1)).toBeUndefined()
+  for await (const _ of $.turn.step({ ...step, index: 1 })) void _
+  expect((await $.tool.check({ tool: 'Bash', input: { command: 'npm publish' } })).decision).toBe('ask')
+
+  expect(seen).toEqual([
+    { model: 'haiku', effort: 'low' },
+    { model: 'sonnet', effort: 'high' },
+  ])
+})
+
+test('a control file from before 1.0.0 counts only while it is held', async ($, on) => {
   const files = new Map([[CONTROL, takenOver({ model: 'haiku', effort: 'low' })]])
   engine(on, files, noWait)
   const seen: { model: string; effort?: unknown }[] = []
@@ -188,6 +264,7 @@ test('the bot model and effort reach each request, and only while it has the ses
 
   const step = { turnId: 't1', index: 0, model: 'sonnet', effort: 'high' as const, messageCount: 1 }
   for await (const _ of $.turn.step(step)) void _
+  // released by a clawdctl older than 1.0.0, which kept no record of them
   files.set(CONTROL, JSON.stringify({ takenOver: false }))
   for await (const _ of $.turn.step({ ...step, index: 1 })) void _
 

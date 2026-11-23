@@ -32,7 +32,7 @@ const refuse = (message) => { throw new Refusal(message); };
 
 const sub = (...p) => path.join(DIR, ...p);
 function ensureDirs() {
-  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci', 'files', 'screen', 'subagents']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
+  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci', 'files', 'screen', 'subagents', 'runs']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
 }
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; }
@@ -81,6 +81,7 @@ function describe(a, asks) {
   const control = controlOf(a.sessionId);
   const live = control ? readJson(sub('live', `${a.sessionId}.json`)) : undefined;
   const pending = asks.filter((k) => k.sessionId === a.sessionId);
+  const runs = runsOf(a.sessionId, control);
   return {
     session: a.sessionId,
     shortId: a.kind === 'background' ? a.id : undefined,
@@ -92,9 +93,11 @@ function describe(a, asks) {
     takenOver: !!control,
     mode: control?.mode,
     reportEveryMin: control?.reportEveryMin,
-    model: control?.model ?? live?.model,
-    effort: control?.effort,
-    permissions: control?.permissions,
+    model: runs.model ?? live?.model,
+    effort: runs.effort,
+    permissions: runs.permissions,
+    // the bot's settings, still in force on a session it has let go of
+    keptByBot: !control && Object.keys(runs).length ? runs : undefined,
     asks: pending.map((k) => k.id),
     lastAnswer: live?.lastAnswer ? clip(live.lastAnswer, 600) : undefined,
     costUsd: live?.costUsd,
@@ -176,7 +179,7 @@ const commands = {
   async take_over({ session, mode }) {
     const a = resolve(session);
     const now = controlOf(a.sessionId);
-    writeJson(sub('control', `${a.sessionId}.json`), { takenOver: true, mode: mode === 'babysit' ? 'babysit' : mode === 'handle' ? 'handle' : now?.mode ?? 'handle', by: 'bot', since: now?.since ?? Date.now(), reportEveryMin: now?.reportEveryMin });
+    writeJson(sub('control', `${a.sessionId}.json`), { takenOver: true, mode: mode === 'babysit' ? 'babysit' : mode === 'handle' ? 'handle' : now?.mode ?? 'handle', by: 'bot', since: now?.since ?? Date.now(), reportEveryMin: now?.reportEveryMin, ...runsOf(a.sessionId, now) });
     // the mod answers by writing the session's live file; a session opened before Clawd was installed never does
     const live = sub('live', `${a.sessionId}.json`);
     const wait = Number(process.env.CLAWD_TAKEOVER_WAIT_MS ?? 8_000);
@@ -187,9 +190,17 @@ const commands = {
 
   release({ session }) {
     const a = resolve(session);
+    // the bot's model, effort and permission mode stay; a control file from before 1.0.0 is their only record
+    const kept = runsOf(a.sessionId);
+    writeRuns(a.sessionId, kept);
     writeJson(sub('control', `${a.sessionId}.json`), { takenOver: false });
     clearSubagentSteer(a.sessionId);
-    return { session: a.sessionId, name: a.name, takenOver: false, note: 'Released. Prompts show at the machine again; a question you were holding goes back to the local dialog.' };
+    const set = Object.entries(kept).map(([k, v]) => `${k} ${v}`).join(', ');
+    return {
+      session: a.sessionId, name: a.name, takenOver: false,
+      ...(set && { kept }),
+      note: `Released. Prompts show at the machine again; a question you were holding goes back to the local dialog.${set ? ` What you set stays in force (${set}): set it to "default" to give the session its own back.` : ''}`,
+    };
   },
 
   set_mode({ session, mode }) {
@@ -295,8 +306,7 @@ const commands = {
     return setRuns(session, { model: model === 'default' ? undefined : model });
   },
   set_permissions({ session, permissions }) {
-    const allowed = ['default', 'acceptEdits', 'dontAsk'];
-    if (!allowed.includes(permissions)) refuse(`Permission mode is one of ${allowed.join(', ')}. plan, auto and bypass are not offered: set them at the computer.`);
+    if (!PERMISSIONS.includes(permissions)) refuse(`Permission mode is one of ${PERMISSIONS.join(', ')}. plan and auto are not offered: set them at the computer.`);
     return setRuns(session, { permissions: permissions === 'default' ? undefined : permissions });
   },
   set_effort({ session, effort }) {
@@ -956,13 +966,42 @@ function post(hook, events) {
 }
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const PERMISSIONS = ['default', 'acceptEdits', 'dontAsk', 'bypass'];
+
+// what the bot set for a session itself (model, effort, permission mode): runs/<session>.json, which a release leaves
+// in place, so the settings stay until the bot sets "default" (or the person types /clawd clear). A session held
+// before 1.0.0 has them in its control file only.
+function runsOf(sessionId, c = controlOf(sessionId)) {
+  const kept = readJson(sub('runs', `${sessionId}.json`));
+  const r = kept ?? (c ? { model: c.model, effort: c.effort, permissions: c.permissions } : {});
+  return Object.fromEntries(Object.entries({ model: r.model, effort: r.effort, permissions: r.permissions }).filter(([, v]) => v));
+}
+
+function writeRuns(sessionId, next) {
+  const file = sub('runs', `${sessionId}.json`);
+  if (Object.keys(next).length) writeJson(file, next);
+  else fs.rmSync(file, { force: true });
+}
 
 function setRuns(ref, change) {
   const a = resolve(ref);
-  const c = controlOf(a.sessionId) ?? refuse(`Session ${a.name ?? a.sessionId} is not taken over. Take it over first.`);
-  const next = { ...c, ...change };
-  writeJson(sub('control', `${a.sessionId}.json`), next);
-  return { session: a.sessionId, model: next.model ?? 'session default', effort: next.effort ?? 'session default', permissions: next.permissions ?? 'session default', note: 'Applies from the next request, for as long as the bot has the session.' };
+  const c = controlOf(a.sessionId);
+  // a setting needs the session held; "default" clears one whether or not the bot still has it
+  if (!c && Object.values(change).some((v) => v !== undefined)) refuse(`Session ${a.name ?? a.sessionId} is not taken over. Take it over first.`);
+  const next = Object.fromEntries(Object.entries({ ...runsOf(a.sessionId, c), ...change }).filter(([, v]) => v));
+  writeRuns(a.sessionId, next);
+  // a session whose mod is older than 1.0.0 reads them from its control file
+  if (c) writeJson(sub('control', `${a.sessionId}.json`), { ...c, model: next.model, effort: next.effort, permissions: next.permissions });
+  return {
+    session: a.sessionId,
+    takenOver: !!c,
+    model: next.model ?? 'session default',
+    effort: next.effort ?? 'session default',
+    permissions: next.permissions ?? 'session default',
+    note: Object.keys(next).length
+      ? 'Applies from the next request, and stays after you release the session until you set it back to "default".'
+      : 'The session is back on its own model, effort and permission mode.',
+  };
 }
 
 function steer(ref, item) {
@@ -1277,9 +1316,9 @@ const TOOLS = [
   ['send_message', 'Send a message to a taken-over session, as if the person typed it. It runs when the session is next idle. file attaches a file put with put_file.', { session: S, text: S, file: S }, ['session', 'text'], 'send'],
   ['put_file', 'Put a file from the chat onto this machine (an https link, up to 20 MB), to attach with send_message.', { name: S, url: S }, ['name', 'url'], 'put'],
   ['interrupt', 'Stop what a taken-over session is doing right now (like pressing Esc).', { session: S }, ['session'], 'interrupt'],
-  ['set_model', 'Change the model of a taken-over session from its next request on, while you have it. "default" goes back to its own.', { session: S, model: S }, ['session', 'model'], 'set_model'],
-  ['set_effort', 'Change the reasoning effort (low, medium, high, xhigh, max) of a taken-over session from its next request on, while you have it. "default" goes back to its own.', { session: S, effort: S }, ['session', 'effort'], 'set_effort'],
-  ['set_permissions', 'Set how a taken-over session handles permission prompts while you have it: acceptEdits allows file edits inside its folder without asking, dontAsk denies anything not pre-approved, default goes back to asking you.', { session: S, permissions: { ...S, enum: ['default', 'acceptEdits', 'dontAsk'] } }, ['session', 'permissions'], 'set_permissions'],
+  ['set_model', 'Change the model of a taken-over session from its next request on. It stays after you release the session; "default" (which works on a released session too) goes back to its own.', { session: S, model: S }, ['session', 'model'], 'set_model'],
+  ['set_effort', 'Change the reasoning effort (low, medium, high, xhigh, max) of a taken-over session from its next request on. It stays after you release the session; "default" (which works on a released session too) goes back to its own.', { session: S, effort: S }, ['session', 'effort'], 'set_effort'],
+  ['set_permissions', 'Set how a taken-over session handles permission prompts: acceptEdits allows file edits inside its folder without asking, dontAsk denies anything not pre-approved, bypass allows everything Claude would ask about (deny rules and safety floors on the computer still refuse). It stays after you release the session, so set bypass only when the person asked for it; default (which works on a released session too) goes back to asking.', { session: S, permissions: { ...S, enum: PERMISSIONS } }, ['session', 'permissions'], 'set_permissions'],
   ['set_report', 'Push a short progress report for a taken-over session every N minutes, or "off".', { session: S, minutes: S }, ['session', 'minutes'], 'set_report'],
   ['peek', 'The last messages of a session and its state, to summarise it for the person.', { session: S, count: { type: 'number' } }, ['session'], 'peek'],
   ['list_subagents', 'The subagents a session started, Claude and Codex alike, as Overseer sees them: id, name, kind (claude or codex), model, effort, status, steps, tokens and last activity. Needs Overseer on the machine.', { session: S }, ['session'], 'subagents'],
@@ -1444,7 +1483,7 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl take-over <session> [--mode handle|babysit] | release <session> | mode <session> handle|babysit
   clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --answers '<json>'
   clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
-  clawdctl permissions <session> default|acceptEdits|dontAsk
+  clawdctl permissions <session> default|acceptEdits|dontAsk|bypass   (model, effort and permissions stay after release; "default" clears)
   clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
   clawdctl subagents <session>                     its subagents (Claude and Codex), as Overseer sees them
   clawdctl subagent <session> <id> [--count n]     a subagent's prompt and recent thread
