@@ -152,11 +152,57 @@ test('model, effort and permission mode are set, checked and undone', async () =
   await clawdctl(['permissions', 'api-fix', 'acceptEdits']);
   assert.deepEqual([control().model, control().effort, control().permissions], ['haiku', 'max', 'acceptEdits']);
 
+  assert.deepEqual(read('runs', `${SESSION}.json`), { model: 'haiku', effort: 'max', permissions: 'acceptEdits' });
+
   assert.match((await clawdctl(['effort', 'api-fix', 'extreme'])).stderr, /Effort is one of/);
-  assert.match((await clawdctl(['permissions', 'api-fix', 'bypassPermissions'])).stderr, /not offered/);
+  for (const mode of ['bypassPermissions', 'plan', 'auto']) assert.match((await clawdctl(['permissions', 'api-fix', mode])).stderr, /plan and auto are not offered/, mode);
+  const bypass = await clawdctl(['permissions', 'api-fix', 'bypass']);
+  assert.equal(bypass.code, 0, bypass.stderr);
+  assert.equal(bypass.json.permissions, 'bypass');
+  assert.equal(control().permissions, 'bypass');
 
   for (const [cmd, value] of [['model', 'default'], ['effort', 'default'], ['permissions', 'default']]) await clawdctl([cmd, 'api-fix', value]);
   assert.deepEqual([control().model, control().effort, control().permissions, control().takenOver], [undefined, undefined, undefined, true]);
+  assert.equal(fs.existsSync(path.join(dir, 'runs', `${SESSION}.json`)), false);
+});
+
+test('what the bot set stays after release, until it sets "default"', async () => {
+  await clawdctl(['take-over', 'api-fix']);
+  await clawdctl(['model', 'api-fix', 'haiku']);
+  await clawdctl(['permissions', 'api-fix', 'bypass']);
+
+  const released = await clawdctl(['release', 'api-fix']);
+  assert.equal(released.code, 0, released.stderr);
+  assert.deepEqual(released.json.kept, { model: 'haiku', permissions: 'bypass' });
+  assert.match(released.json.note, /stays in force.*"default"/);
+  assert.deepEqual(control(), { takenOver: false });
+  assert.deepEqual(read('runs', `${SESSION}.json`), { model: 'haiku', permissions: 'bypass' });
+  const listed = (await clawdctl(['sessions'])).json.sessions.find((s) => s.session === SESSION);
+  assert.deepEqual([listed.takenOver, listed.permissions, listed.keptByBot], [false, 'bypass', { model: 'haiku', permissions: 'bypass' }]);
+
+  // a new setting needs the session again; "default" clears one without it
+  assert.match((await clawdctl(['effort', 'api-fix', 'low'])).stderr, /not taken over/);
+  const cleared = await clawdctl(['permissions', 'api-fix', 'default']);
+  assert.equal(cleared.code, 0, cleared.stderr);
+  assert.deepEqual([cleared.json.takenOver, cleared.json.permissions, cleared.json.model], [false, 'session default', 'haiku']);
+  assert.deepEqual(control(), { takenOver: false });
+
+  // taken over again, the kept model is in the control file too, for a mod older than 1.0.0
+  await clawdctl(['take-over', 'api-fix']);
+  assert.equal(control().model, 'haiku');
+  await clawdctl(['model', 'api-fix', 'default']);
+  await clawdctl(['release', 'api-fix']);
+  assert.equal(fs.existsSync(path.join(dir, 'runs', `${SESSION}.json`)), false);
+});
+
+test('a release keeps what a control file from before 1.0.0 carried', async () => {
+  fs.mkdirSync(path.join(dir, 'control'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'control', `${SESSION}.json`), JSON.stringify({ takenOver: true, mode: 'handle', by: 'bot', since: 1, effort: 'low', permissions: 'dontAsk' }));
+  const released = await clawdctl(['release', 'api-fix']);
+  assert.deepEqual(released.json.kept, { effort: 'low', permissions: 'dontAsk' });
+  assert.deepEqual(read('runs', `${SESSION}.json`), { effort: 'low', permissions: 'dontAsk' });
+  for (const [cmd, value] of [['effort', 'default'], ['permissions', 'default']]) await clawdctl([cmd, 'api-fix', value]);
+  assert.equal(fs.existsSync(path.join(dir, 'runs', `${SESSION}.json`)), false);
 });
 
 test('send and interrupt reach the session inbox', async () => {
@@ -427,6 +473,30 @@ test('a scheduled task is listed, can be cancelled, and refuses a time already p
   assert.equal((await clawdctl(['unschedule', r.json.id])).json.cancelled, true);
   assert.equal((await clawdctl(['schedules'])).json.tasks.length, 0);
   assert.equal((await clawdctl(['schedule', '--at', '2020-01-01T00:00', '--folder', '/w/api', '--prompt', 'x'])).code, 1);
+});
+
+test('on Linux a scheduled task is a persistent systemd timer in unit files, and cancelling removes them', { skip: process.platform !== 'linux' }, async () => {
+  const bin = fs.mkdtempSync(path.join(root, 'bin-'));
+  const xdg = fs.mkdtempSync(path.join(root, 'xdg-'));
+  const calls = path.join(bin, 'calls');
+  fs.writeFileSync(path.join(bin, 'systemctl'), `#!/bin/sh\necho "$*" >> ${JSON.stringify(calls)}\n`, { mode: 0o755 });
+  const run = (args) => new Promise((resolve) => execFile(process.execPath, [CLAWDCTL, ...args], {
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, HOME: home, CLAWD_HOME: dir, CLAUDE_BIN: path.join(root, 'claude'), XDG_CONFIG_HOME: path.join(xdg, 'config'), XDG_DATA_HOME: path.join(xdg, 'data') },
+  }, (err, stdout) => resolve({ code: err ? 1 : 0, json: JSON.parse(stdout || 'null') })));
+  const { json } = await run(['schedule', '--at', '+2h', '--folder', '/w/api', '--prompt', 'Run the nightly checks']);
+  const unit = (ext) => path.join(xdg, 'config', 'systemd', 'user', `clawd-${json.id}.${ext}`);
+  const timer = fs.readFileSync(unit('timer'), 'utf8');
+  const service = fs.readFileSync(unit('service'), 'utf8');
+  assert.match(timer, /^OnCalendar=\d{4}-\d\d-\d\d \d\d:\d\d:00$/m);
+  assert.match(timer, /^Persistent=true$/m);
+  assert.match(timer, /^WantedBy=timers\.target$/m);
+  assert.ok(service.includes(`Environment="CLAWD_HOME=${dir}"`));
+  assert.match(service, new RegExp(`^ExecStart=.* "run-scheduled" "${json.id}"$`, 'm'));
+  assert.deepEqual(fs.readFileSync(calls, 'utf8').trim().split('\n'), ['--user daemon-reload', `--user enable --now clawd-${json.id}.timer`]);
+
+  assert.equal((await run(['unschedule', json.id])).json.cancelled, true);
+  assert.equal(fs.existsSync(unit('timer')) || fs.existsSync(unit('service')), false);
+  assert.deepEqual(fs.readFileSync(calls, 'utf8').trim().split('\n').slice(2), [`--user stop clawd-${json.id}.timer`, `--user disable clawd-${json.id}.timer`, '--user daemon-reload']);
 });
 
 test('a scheduled task that runs pushes a scheduled event', async () => {
@@ -769,6 +839,20 @@ test('subagents says cleanly when Overseer is not installed, and when a session 
   assert.deepEqual(empty.json.subagents, []);
   assert.deepEqual(empty.json.overseer, { installed: true, version: '0.3.0', courier: true });
   assert.match(empty.json.note, /restarted/);
+
+  // the session itself says Overseer is not loaded there
+  fs.mkdirSync(path.join(dir, 'subagents', SESSION), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'subagents', SESSION, 'agents.json'), JSON.stringify({ sessionId: SESSION, pid: 1, at: Date.now(), overseer: false, agents: [] }));
+  const notHere = await clawdctl(['subagents', 'api-fix']);
+  assert.equal(notHere.code, 1);
+  assert.match(notHere.stderr, /Overseer is not running in this session/);
+
+  fs.writeFileSync(path.join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'overseer@overseer': false } }));
+  const off = await clawdctl(['subagents', 'api-fix']);
+  assert.equal(off.code, 1);
+  assert.match(off.stderr, /installed but turned off.*claude plugin enable overseer@overseer/s);
+  fs.rmSync(path.join(home, '.claude', 'settings.json'));
+  fs.rmSync(path.join(dir, 'subagents', SESSION), { recursive: true });
 });
 
 test('subagents lists Claude and Codex subagents as Overseer sees them, with what the bot set', async () => {

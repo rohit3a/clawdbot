@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Cut a Clawd release: node scripts/release.mjs <version> [--dry-run]
-// 1. on a clean, up-to-date main: set the version, validate and test the plugin, commit and tag v<version>
+// 1. on a clean, up-to-date main: set the version (committed only if the PR did not set it already), validate and
+//    test the plugin, tag v<version>; any failing check stops it with nothing committed
 // 2. pin the marketplace to that tag's commit, so installs and updates get exactly the release
 // 3. push, then publish a GitHub release with the notes from CHANGELOG.md, a tarball and SHA256SUMS
 
@@ -40,28 +41,49 @@ const changelog = fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8');
 const notes = changelog.split(/^## /m).find(s => s.startsWith(`${version}\n`) || s.startsWith(`${version} `))?.split('\n').slice(1).join('\n').trim();
 if (!notes) fail(`CHANGELOG.md has no "## ${version}" section`);
 
-step(`version ${version}`);
-editJson(`${PLUGIN}/.claude-plugin/plugin.json`, p => { p.version = version; });
+// the PR that made the release may have set the version already; then there is nothing to commit for it
+const restore = () => git('checkout', '--', PLUGIN);
+const manifest = `${PLUGIN}/.claude-plugin/plugin.json`;
 const ctl = path.join(ROOT, PLUGIN, 'bin/clawdctl.mjs');
 const src = fs.readFileSync(ctl, 'utf8');
-if (!/^const VERSION = '[^']*';$/m.test(src)) fail('no VERSION line in clawdctl.mjs');
-fs.writeFileSync(ctl, src.replace(/^const VERSION = '[^']*';$/m, `const VERSION = '${version}';`));
+const VERSION_LINE = /^const VERSION = '([^']*)';$/m;
+const ctlVersion = src.match(VERSION_LINE)?.[1];
+if (ctlVersion === undefined) fail('no VERSION line in clawdctl.mjs');
+const bumped = JSON.parse(fs.readFileSync(path.join(ROOT, manifest), 'utf8')).version !== version || ctlVersion !== version;
+if (bumped) {
+  editJson(manifest, p => { p.version = version; });
+  fs.writeFileSync(ctl, src.replace(VERSION_LINE, `const VERSION = '${version}';`));
+}
+step(bumped ? `version ${version}` : `version ${version} (already set)`);
 
+// every check must pass; a failure puts the files back and stops before anything is committed
 step('validate and test');
-run('claude', ['plugin', 'validate', PLUGIN], { stdio: 'inherit' });
-run('claude', ['plugin', 'validate', '.'], { stdio: 'inherit' });
-run('claude', ['plugin', 'test', PLUGIN], { stdio: 'inherit' });
-run(process.execPath, ['--test', ...fs.readdirSync(path.join(ROOT, 'tests')).filter(f => f.endsWith('.test.mjs')).map(f => `tests/${f}`)], { stdio: 'inherit' });
+const checks = [
+  ['claude', ['plugin', 'validate', PLUGIN]],
+  ['claude', ['plugin', 'validate', '.']],
+  ['claude', ['plugin', 'test', PLUGIN]],
+  [process.execPath, ['--test', ...fs.readdirSync(path.join(ROOT, 'tests')).filter(f => f.endsWith('.test.mjs')).map(f => `tests/${f}`)]],
+];
+for (const [cmd, args] of checks) {
+  try {
+    run(cmd, args, { stdio: 'inherit' });
+  } catch {
+    if (bumped) restore();
+    fail(`${path.basename(cmd)} ${args.join(' ')} failed; nothing was committed`);
+  }
+}
 
 if (dry) {
-  git('checkout', '--', PLUGIN);
+  if (bumped) restore();
   step('dry run: stopped before committing; nothing changed');
   process.exit(0);
 }
 
-step(`commit and tag ${tag}`);
-git('add', '-A', PLUGIN);
-git('commit', '--quiet', '-m', `Clawd ${version}`);
+step(bumped ? `commit and tag ${tag}` : `tag ${tag}`);
+if (bumped) {
+  git('add', '-A', PLUGIN);
+  git('commit', '--quiet', '-m', `Clawd ${version}`);
+}
 git('tag', '-a', tag, '-m', `Clawd ${version}`);
 const sha = git('rev-parse', `${tag}^{commit}`);
 

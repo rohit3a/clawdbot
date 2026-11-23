@@ -24,7 +24,7 @@ description: >-
 | Start one | `start --folder '<dir>' --prompt '<text>' --name '<n>' --model <m> --effort <e> [--mode babysit]` |
 | Take over, hand back | `take-over '<s>' [--mode handle\|babysit]`, `release '<s>'`, `mode '<s>' handle\|babysit` |
 | Answer | `answer <askId> --pick '<label>'`, `answer <askId> --answers '<json>'`, `answer <askId> --decision allow\|deny [--reason '<why>'] [--remember]` |
-| Steer | `send '<s>' '<text>' [--file '<path>']`, `put '<name>' --url '<link>'`, `interrupt '<s>'`, `model '<s>' <m>`, `effort '<s>' <low\|medium\|high\|xhigh\|max>`, `permissions '<s>' acceptEdits\|dontAsk` (`default` undoes each) |
+| Steer | `send '<s>' '<text>' [--file '<path>']`, `put '<name>' --url '<link>'`, `interrupt '<s>'`, `model '<s>' <m>`, `effort '<s>' <low\|medium\|high\|xhigh\|max>`, `permissions '<s>' acceptEdits\|dontAsk\|bypass` (`default` undoes each, also after release; they stay until then) |
 | Watch | `peek '<s>' [--count n]`, `report '<s>' <minutes\|off>`, `remote '<s>'` (Remote Control link) |
 | Screen | `screen '<s>' [--dismiss] [--full]` (the dialog or panel it shows; `--dismiss` sends Escape after) |
 | Plan usage | `usage [--fresh]` (session and weekly limits, percent used, reset times) |

@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { panelOf, render, usageLimits } from './screen.mjs';
 
-const VERSION = '0.8.0';
+const VERSION = '1.0.0';
 const HOME = os.homedir();
 const DIR = process.env.CLAWD_HOME || path.join(HOME, '.clawd');
 const PUSH_GAP_MS = 20_000;
@@ -32,7 +32,7 @@ const refuse = (message) => { throw new Refusal(message); };
 
 const sub = (...p) => path.join(DIR, ...p);
 function ensureDirs() {
-  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci', 'files', 'screen', 'subagents']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
+  for (const d of ['control', 'claims', 'inbox', 'asks', 'answers', 'live', 'outbox', 'requests', 'grok', 'schedule', 'ci', 'files', 'screen', 'subagents', 'runs']) fs.mkdirSync(sub(d), { recursive: true, mode: 0o700 });
 }
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; }
@@ -81,6 +81,7 @@ function describe(a, asks) {
   const control = controlOf(a.sessionId);
   const live = control ? readJson(sub('live', `${a.sessionId}.json`)) : undefined;
   const pending = asks.filter((k) => k.sessionId === a.sessionId);
+  const runs = runsOf(a.sessionId, control);
   return {
     session: a.sessionId,
     shortId: a.kind === 'background' ? a.id : undefined,
@@ -92,9 +93,11 @@ function describe(a, asks) {
     takenOver: !!control,
     mode: control?.mode,
     reportEveryMin: control?.reportEveryMin,
-    model: control?.model ?? live?.model,
-    effort: control?.effort,
-    permissions: control?.permissions,
+    model: runs.model ?? live?.model,
+    effort: runs.effort,
+    permissions: runs.permissions,
+    // the bot's settings, still in force on a session it has let go of
+    keptByBot: !control && Object.keys(runs).length ? runs : undefined,
     asks: pending.map((k) => k.id),
     lastAnswer: live?.lastAnswer ? clip(live.lastAnswer, 600) : undefined,
     costUsd: live?.costUsd,
@@ -176,7 +179,7 @@ const commands = {
   async take_over({ session, mode }) {
     const a = resolve(session);
     const now = controlOf(a.sessionId);
-    writeJson(sub('control', `${a.sessionId}.json`), { takenOver: true, mode: mode === 'babysit' ? 'babysit' : mode === 'handle' ? 'handle' : now?.mode ?? 'handle', by: 'bot', since: now?.since ?? Date.now(), reportEveryMin: now?.reportEveryMin });
+    writeJson(sub('control', `${a.sessionId}.json`), { takenOver: true, mode: mode === 'babysit' ? 'babysit' : mode === 'handle' ? 'handle' : now?.mode ?? 'handle', by: 'bot', since: now?.since ?? Date.now(), reportEveryMin: now?.reportEveryMin, ...runsOf(a.sessionId, now) });
     // the mod answers by writing the session's live file; a session opened before Clawd was installed never does
     const live = sub('live', `${a.sessionId}.json`);
     const wait = Number(process.env.CLAWD_TAKEOVER_WAIT_MS ?? 8_000);
@@ -187,9 +190,17 @@ const commands = {
 
   release({ session }) {
     const a = resolve(session);
+    // the bot's model, effort and permission mode stay; a control file from before 1.0.0 is their only record
+    const kept = runsOf(a.sessionId);
+    writeRuns(a.sessionId, kept);
     writeJson(sub('control', `${a.sessionId}.json`), { takenOver: false });
     clearSubagentSteer(a.sessionId);
-    return { session: a.sessionId, name: a.name, takenOver: false, note: 'Released. Prompts show at the machine again; a question you were holding goes back to the local dialog.' };
+    const set = Object.entries(kept).map(([k, v]) => `${k} ${v}`).join(', ');
+    return {
+      session: a.sessionId, name: a.name, takenOver: false,
+      ...(set && { kept }),
+      note: `Released. Prompts show at the machine again; a question you were holding goes back to the local dialog.${set ? ` What you set stays in force (${set}): set it to "default" to give the session its own back.` : ''}`,
+    };
   },
 
   set_mode({ session, mode }) {
@@ -295,8 +306,7 @@ const commands = {
     return setRuns(session, { model: model === 'default' ? undefined : model });
   },
   set_permissions({ session, permissions }) {
-    const allowed = ['default', 'acceptEdits', 'dontAsk'];
-    if (!allowed.includes(permissions)) refuse(`Permission mode is one of ${allowed.join(', ')}. plan, auto and bypass are not offered: set them at the computer.`);
+    if (!PERMISSIONS.includes(permissions)) refuse(`Permission mode is one of ${PERMISSIONS.join(', ')}. plan and auto are not offered: set them at the computer.`);
     return setRuns(session, { permissions: permissions === 'default' ? undefined : permissions });
   },
   set_effort({ session, effort }) {
@@ -575,15 +585,20 @@ function overseerInfo() {
   const rows = readJson(path.join(cfg, 'plugins', 'installed_plugins.json'))?.plugins ?? {};
   const pick = (name) => { const r = rows[name]; return Array.isArray(r) ? r.find((x) => x.scope === 'user') ?? r[0] : undefined; };
   const o = pick('overseer@overseer');
-  return { installed: !!o, version: o?.version ?? null, courier: !!pick('overseer-courier@overseer') };
+  const enabled = readJson(path.join(cfg, 'settings.json'))?.enabledPlugins?.['overseer@overseer'] !== false;
+  return { installed: !!o, ...(o && !enabled && { enabled: false }), version: o?.version ?? null, courier: !!pick('overseer-courier@overseer') };
 }
 
+// the session's own copy says whether Overseer is loaded there (overseer: false when it is not)
 function subagentsOf(a) {
   pruneSubagents();
   const mirror = readJson(sub('subagents', a.sessionId, 'agents.json'));
   if (mirror?.overseer) return { mirror };
-  if (!overseerInfo().installed) refuse(`Overseer is not installed on this computer, so subagents can't be watched or steered. To add it: ${OVERSEER_INSTALL}. Sessions started after that have it.`);
-  return { mirror: undefined, note: 'No subagents seen in this session. Overseer is installed, but a session opened before it or before Clawd 0.8.0 reports none until it is restarted.' };
+  const info = overseerInfo();
+  if (!info.installed) refuse(`Overseer is not installed on this computer, so subagents can't be watched or steered. To add it: ${OVERSEER_INSTALL}. Sessions started after that have it.`);
+  if (info.enabled === false) refuse('Overseer is installed but turned off, so subagents can\'t be watched or steered. claude plugin enable overseer@overseer turns it on; sessions started after that have it.');
+  if (mirror?.overseer === false) refuse('Overseer is not running in this session (it started before Overseer was installed, or with it turned off), so its subagents can\'t be watched or steered. A session started now has it.');
+  return { mirror: undefined, note: 'No subagents seen in this session yet. A session opened before Clawd 0.8.0 reports none until it is restarted.' };
 }
 
 // a session's copy is kept a week after it was last written, so the bot can still read an ended session's subagents
@@ -951,13 +966,42 @@ function post(hook, events) {
 }
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const PERMISSIONS = ['default', 'acceptEdits', 'dontAsk', 'bypass'];
+
+// what the bot set for a session itself (model, effort, permission mode): runs/<session>.json, which a release leaves
+// in place, so the settings stay until the bot sets "default" (or the person types /clawd clear). A session held
+// before 1.0.0 has them in its control file only.
+function runsOf(sessionId, c = controlOf(sessionId)) {
+  const kept = readJson(sub('runs', `${sessionId}.json`));
+  const r = kept ?? (c ? { model: c.model, effort: c.effort, permissions: c.permissions } : {});
+  return Object.fromEntries(Object.entries({ model: r.model, effort: r.effort, permissions: r.permissions }).filter(([, v]) => v));
+}
+
+function writeRuns(sessionId, next) {
+  const file = sub('runs', `${sessionId}.json`);
+  if (Object.keys(next).length) writeJson(file, next);
+  else fs.rmSync(file, { force: true });
+}
 
 function setRuns(ref, change) {
   const a = resolve(ref);
-  const c = controlOf(a.sessionId) ?? refuse(`Session ${a.name ?? a.sessionId} is not taken over. Take it over first.`);
-  const next = { ...c, ...change };
-  writeJson(sub('control', `${a.sessionId}.json`), next);
-  return { session: a.sessionId, model: next.model ?? 'session default', effort: next.effort ?? 'session default', permissions: next.permissions ?? 'session default', note: 'Applies from the next request, for as long as the bot has the session.' };
+  const c = controlOf(a.sessionId);
+  // a setting needs the session held; "default" clears one whether or not the bot still has it
+  if (!c && Object.values(change).some((v) => v !== undefined)) refuse(`Session ${a.name ?? a.sessionId} is not taken over. Take it over first.`);
+  const next = Object.fromEntries(Object.entries({ ...runsOf(a.sessionId, c), ...change }).filter(([, v]) => v));
+  writeRuns(a.sessionId, next);
+  // a session whose mod is older than 1.0.0 reads them from its control file
+  if (c) writeJson(sub('control', `${a.sessionId}.json`), { ...c, model: next.model, effort: next.effort, permissions: next.permissions });
+  return {
+    session: a.sessionId,
+    takenOver: !!c,
+    model: next.model ?? 'session default',
+    effort: next.effort ?? 'session default',
+    permissions: next.permissions ?? 'session default',
+    note: Object.keys(next).length
+      ? 'Applies from the next request, and stays after you release the session until you set it back to "default".'
+      : 'The session is back on its own model, effort and permission mode.',
+  };
 }
 
 function steer(ref, item) {
@@ -1083,23 +1127,33 @@ function whenOf(at) {
   return Math.ceil(t / 60_000) * 60_000;
 }
 
-// macOS: a launchd agent (runs at wake if the Mac slept through it). Linux: a systemd user timer.
+// macOS: a launchd agent (runs at wake if the Mac slept through it). Linux: a persistent systemd user timer, in unit
+// files that outlive a reboot; one whose time passed while the computer was off runs when the user's systemd starts
+// again (at boot with lingering on, else at login).
 const plistOf = (id) => path.join(HOME, 'Library', 'LaunchAgents', `com.clawd.${id}.plist`);
+const unitDir = () => path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, '.config'), 'systemd', 'user');
+const unitOf = (id, ext) => path.join(unitDir(), `clawd-${id}.${ext}`);
+// a value in a unit file: quoted, with systemd's specifiers and variables taken literally
+const unitWord = (s) => `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%').replace(/\$/g, '$$$$')}"`;
+const systemctl = (...args) => execFileSync('systemctl', ['--user', ...args], { stdio: 'ignore', timeout: 15_000 });
 function timerCommand(id) {
   const shim = path.join(HOME, '.local', 'bin', 'clawdctl');
   return fs.existsSync(shim) ? ['/bin/sh', shim, 'run-scheduled', id] : [process.execPath, fileURLToPath(import.meta.url), 'run-scheduled', id];
 }
+// the task runs with the PATH clawdctl was given, and finds its task under the same CLAWD_HOME
+const timerEnv = () => ({ PATH: USER_PATH, ...(process.env.CLAWD_HOME && { CLAWD_HOME: path.resolve(DIR) }) });
 function installTimer(t) {
   if (process.env.CLAWD_NO_TIMER) return;
   const d = new Date(t.at);
   if (process.platform === 'darwin') {
     const x = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const env = Object.entries(timerEnv()).map(([k, v]) => `<key>${k}</key><string>${x(v)}</string>`).join('');
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.clawd.${t.id}</string>
 <key>ProgramArguments</key><array>${timerCommand(t.id).map((a) => `<string>${x(a)}</string>`).join('')}</array>
-<key>EnvironmentVariables</key><dict><key>PATH</key><string>${x(USER_PATH)}</string></dict>
+<key>EnvironmentVariables</key><dict>${env}</dict>
 <key>StartCalendarInterval</key><dict><key>Month</key><integer>${d.getMonth() + 1}</integer><key>Day</key><integer>${d.getDate()}</integer><key>Hour</key><integer>${d.getHours()}</integer><key>Minute</key><integer>${d.getMinutes()}</integer></dict>
 </dict></plist>
 `;
@@ -1109,7 +1163,17 @@ function installTimer(t) {
   } else {
     const pad = (n) => String(n).padStart(2, '0');
     const cal = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:00`;
-    execFileSync('systemd-run', ['--user', `--unit=clawd-${t.id}`, `--on-calendar=${cal}`, `--setenv=PATH=${USER_PATH}`, ...timerCommand(t.id)], { stdio: 'ignore', timeout: 15_000 });
+    const env = Object.entries(timerEnv()).map(([k, v]) => `Environment=${unitWord(`${k}=${v}`)}\n`).join('');
+    fs.mkdirSync(unitDir(), { recursive: true });
+    fs.writeFileSync(unitOf(t.id, 'service'), `[Unit]\nDescription=Clawd scheduled task ${t.id}\n\n[Service]\nType=oneshot\n${env}ExecStart=${timerCommand(t.id).map(unitWord).join(' ')}\n`);
+    fs.writeFileSync(unitOf(t.id, 'timer'), `[Unit]\nDescription=Clawd scheduled task ${t.id}\n\n[Timer]\nOnCalendar=${cal}\nPersistent=true\nAccuracySec=1s\n\n[Install]\nWantedBy=timers.target\n`);
+    try {
+      systemctl('daemon-reload');
+      systemctl('enable', '--now', `clawd-${t.id}.timer`);
+    } catch (e) {
+      removeTimer(t);
+      throw e;
+    }
   }
 }
 function removeTimer(t) {
@@ -1118,7 +1182,13 @@ function removeTimer(t) {
     fs.rmSync(plistOf(t.id), { force: true });
     try { execFileSync('launchctl', ['bootout', `gui/${process.getuid()}/com.clawd.${t.id}`], { stdio: 'ignore', timeout: 15_000 }); } catch {}
   } else {
-    try { execFileSync('systemctl', ['--user', 'stop', `clawd-${t.id}.timer`], { stdio: 'ignore', timeout: 15_000 }); } catch {}
+    // a running task's own service is left to finish; only its timer goes, and with it both unit files
+    try { systemctl('stop', `clawd-${t.id}.timer`); } catch {}
+    try { systemctl('disable', `clawd-${t.id}.timer`); } catch {}
+    const had = ['timer', 'service'].filter((ext) => fs.existsSync(unitOf(t.id, ext)));
+    for (const ext of had) fs.rmSync(unitOf(t.id, ext), { force: true });
+    fs.rmSync(path.join(process.env.XDG_DATA_HOME || path.join(HOME, '.local', 'share'), 'systemd', 'timers', `stamp-clawd-${t.id}.timer`), { force: true });
+    if (had.length) try { systemctl('daemon-reload'); } catch {}
   }
 }
 
@@ -1246,9 +1316,9 @@ const TOOLS = [
   ['send_message', 'Send a message to a taken-over session, as if the person typed it. It runs when the session is next idle. file attaches a file put with put_file.', { session: S, text: S, file: S }, ['session', 'text'], 'send'],
   ['put_file', 'Put a file from the chat onto this machine (an https link, up to 20 MB), to attach with send_message.', { name: S, url: S }, ['name', 'url'], 'put'],
   ['interrupt', 'Stop what a taken-over session is doing right now (like pressing Esc).', { session: S }, ['session'], 'interrupt'],
-  ['set_model', 'Change the model of a taken-over session from its next request on, while you have it. "default" goes back to its own.', { session: S, model: S }, ['session', 'model'], 'set_model'],
-  ['set_effort', 'Change the reasoning effort (low, medium, high, xhigh, max) of a taken-over session from its next request on, while you have it. "default" goes back to its own.', { session: S, effort: S }, ['session', 'effort'], 'set_effort'],
-  ['set_permissions', 'Set how a taken-over session handles permission prompts while you have it: acceptEdits allows file edits inside its folder without asking, dontAsk denies anything not pre-approved, default goes back to asking you.', { session: S, permissions: { ...S, enum: ['default', 'acceptEdits', 'dontAsk'] } }, ['session', 'permissions'], 'set_permissions'],
+  ['set_model', 'Change the model of a taken-over session from its next request on. It stays after you release the session; "default" (which works on a released session too) goes back to its own.', { session: S, model: S }, ['session', 'model'], 'set_model'],
+  ['set_effort', 'Change the reasoning effort (low, medium, high, xhigh, max) of a taken-over session from its next request on. It stays after you release the session; "default" (which works on a released session too) goes back to its own.', { session: S, effort: S }, ['session', 'effort'], 'set_effort'],
+  ['set_permissions', 'Set how a taken-over session handles permission prompts: acceptEdits allows file edits inside its folder without asking, dontAsk denies anything not pre-approved, bypass allows everything Claude would ask about (deny rules and safety floors on the computer still refuse). It stays after you release the session, so set bypass only when the person asked for it; default (which works on a released session too) goes back to asking.', { session: S, permissions: { ...S, enum: PERMISSIONS } }, ['session', 'permissions'], 'set_permissions'],
   ['set_report', 'Push a short progress report for a taken-over session every N minutes, or "off".', { session: S, minutes: S }, ['session', 'minutes'], 'set_report'],
   ['peek', 'The last messages of a session and its state, to summarise it for the person.', { session: S, count: { type: 'number' } }, ['session'], 'peek'],
   ['list_subagents', 'The subagents a session started, Claude and Codex alike, as Overseer sees them: id, name, kind (claude or codex), model, effort, status, steps, tokens and last activity. Needs Overseer on the machine.', { session: S }, ['session'], 'subagents'],
@@ -1413,7 +1483,7 @@ const USAGE = `clawdctl ${VERSION}: drive Claude Code sessions on this machine f
   clawdctl take-over <session> [--mode handle|babysit] | release <session> | mode <session> handle|babysit
   clawdctl answer <ask> --decision allow|deny [--reason r] | --pick <label> | --answers '<json>'
   clawdctl send <session> <text> | interrupt <session> | model <session> <m> | effort <session> <e>
-  clawdctl permissions <session> default|acceptEdits|dontAsk
+  clawdctl permissions <session> default|acceptEdits|dontAsk|bypass   (model, effort and permissions stay after release; "default" clears)
   clawdctl report <session> <minutes|off> | peek <session> [--count n] | stop <session>
   clawdctl subagents <session>                     its subagents (Claude and Codex), as Overseer sees them
   clawdctl subagent <session> <id> [--count n]     a subagent's prompt and recent thread

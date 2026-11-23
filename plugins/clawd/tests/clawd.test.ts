@@ -10,6 +10,8 @@ type Wait = (script: string) => { exitCode: number; stdout?: string }
 
 // what `ps -A -o args=` lists, for the Codex bridge lookup
 let psOutput = ''
+// what the status line showed, newest last
+const statuses: (string | undefined)[] = []
 
 // The engine beneath the mod: an in-memory disk, a session, and the shell calls the mod makes.
 function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string[] = ['terminal'], logs: string[] = [], ran: string[][] = []) {
@@ -19,7 +21,10 @@ function engine(on: On, files: Map<string, string>, wait: Wait, surfaces: string
   on('session.model', () => ({ value: 'sonnet' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('clock.every', () => ({ value: undefined }))
-  on('ui.status', () => ({ value: undefined }))
+  on('ui.status', (_, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
   on('ui.invalidate', () => ({ value: undefined }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('session.surfaces', () => ({ value: surfaces as never }))
@@ -176,7 +181,78 @@ test('dont ask denies without holding anything', async ($, on) => {
   expect(r.decision).toBe('deny')
 })
 
-test('the bot model and effort reach each request, and only while it has the session', async ($, on) => {
+const RUNS = `${HOME}/.clawd/runs/${SESSION}.json`
+
+// a safety floor such as Permit's: refuses a command outright, whatever the engine below would say
+const floor = {
+  name: 'floor',
+  register: (on: On) => {
+    on('tool.check', async ($, e, next) => {
+      const command = (e.input as { command?: string } | undefined)?.command ?? ''
+      return /push --force/.test(command) ? { decision: 'deny' as const, reason: 'Permit: a floor' } : next(e)
+    })
+  },
+}
+
+test('bypass allows what Claude would ask about; deny rules and safety floors still refuse', { plugins: [floor] }, async ($, on) => {
+  const files = new Map([
+    [CONTROL, takenOver({ permissions: 'bypass' })],
+    [RUNS, JSON.stringify({ permissions: 'bypass' })],
+  ])
+  engine(on, files, noWait)
+  // the engine's own verdict: a deny rule for rm -rf, an ask for anything else
+  on('tool.check', (_, e) => (/rm -rf/.test((e.input as { command?: string }).command ?? '') ? { decision: 'deny', reason: 'a deny rule' } : { decision: 'ask' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+
+  const asked = await $.tool.check({ tool: 'Bash', input: { command: 'curl -X POST https://example.com' } })
+  const write = await $.tool.check({ tool: 'Write', input: { file_path: '/etc/hosts', content: 'x' } })
+  const denied = await $.tool.check({ tool: 'Bash', input: { command: 'rm -rf build' } })
+  const floored = await $.tool.check({ tool: 'Bash', input: { command: 'git push --force origin main' } })
+
+  expect([asked.decision, write.decision]).toEqual(['allow', 'allow'])
+  expect(asked.reason).toMatch(/bypass/)
+  expect(denied).toMatchObject({ decision: 'deny', reason: 'a deny rule' })
+  expect(floored).toMatchObject({ decision: 'deny', reason: 'Permit: a floor' })
+})
+
+test('the bot settings stay after it lets go, show in the status line, and /clawd clear drops them', async ($, on) => {
+  statuses.length = 0
+  const files = new Map([
+    [CONTROL, takenOver({ model: 'haiku', effort: 'low', permissions: 'bypass' })],
+    [RUNS, JSON.stringify({ model: 'haiku', effort: 'low', permissions: 'bypass' })],
+  ])
+  engine(on, files, noWait)
+  on('tool.check', () => ({ decision: 'ask' }))
+  const seen: { model: string; effort?: unknown }[] = []
+  on('turn.step', async function* (_, e) {
+    seen.push({ model: e.model, effort: e.effort })
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await $.turn.start({ turnId: 't0', text: 'go' } as never)
+  expect(statuses.at(-1)).toBe('Clawd Bot has this session · handle it · haiku low bypass')
+
+  const off = await $.command.run(typed('clawd', 'off'))
+  expect(JSON.stringify(off)).toMatch(/settings stay \(haiku low bypass\)/)
+  expect(statuses.at(-1)).toBe("Clawd Bot's settings stay · haiku low bypass · /clawd clear goes back to your own")
+
+  const step = { turnId: 't1', index: 0, model: 'sonnet', effort: 'high' as const, messageCount: 1 }
+  for await (const _ of $.turn.step(step)) void _
+  expect((await $.tool.check({ tool: 'Bash', input: { command: 'npm publish' } })).decision).toBe('allow')
+
+  await $.command.run(typed('clawd', 'clear'))
+  expect(files.has(RUNS)).toBe(false)
+  expect(statuses.at(-1)).toBeUndefined()
+  for await (const _ of $.turn.step({ ...step, index: 1 })) void _
+  expect((await $.tool.check({ tool: 'Bash', input: { command: 'npm publish' } })).decision).toBe('ask')
+
+  expect(seen).toEqual([
+    { model: 'haiku', effort: 'low' },
+    { model: 'sonnet', effort: 'high' },
+  ])
+})
+
+test('a control file from before 1.0.0 counts only while it is held', async ($, on) => {
   const files = new Map([[CONTROL, takenOver({ model: 'haiku', effort: 'low' })]])
   engine(on, files, noWait)
   const seen: { model: string; effort?: unknown }[] = []
@@ -188,6 +264,7 @@ test('the bot model and effort reach each request, and only while it has the ses
 
   const step = { turnId: 't1', index: 0, model: 'sonnet', effort: 'high' as const, messageCount: 1 }
   for await (const _ of $.turn.step(step)) void _
+  // released by a clawdctl older than 1.0.0, which kept no record of them
   files.set(CONTROL, JSON.stringify({ takenOver: false }))
   for await (const _ of $.turn.step({ ...step, index: 1 })) void _
 
@@ -355,6 +432,20 @@ test('an idle session pushes nothing when a turn fails', async ($, on) => {
   await $.turn.complete({ turnId: 't1', answer: 'API error', durationMs: 5, isAborted: false, reason: 'error' })
 
   expect(outbox(files)).toEqual([])
+})
+
+test('a turn that ends just after the bot lets go of the session is not pushed', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, noWait)
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await $.turn.start({ turnId: 't1', text: 'go' } as never)
+  const before = outbox(files).length
+
+  files.set(CONTROL, JSON.stringify({ takenOver: false }))
+  await $.turn.complete({ turnId: 't1', answer: 'Done.', durationMs: 5, isAborted: false, reason: 'answer' })
+
+  expect(outbox(files).slice(before).map(e => e.kind)).not.toContain('turn_done')
 })
 
 // tool.list is raised by the engine, not by a test, so a second plugin asks for the list the session would get
@@ -611,6 +702,54 @@ test('the bot\'s message goes to a Claude subagent by session.send, to a finishe
   expect(files.has(request[0].replace(/\.json$/, '.ok'))).toBe(true)
   expect(ran).toContainEqual(['kill', '-USR1', '999'])
   psOutput = ''
+})
+
+test('with an Overseer that takes control, steering goes through it, and release puts back what the bot set', { plugins: [overseer] }, async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, noWait)
+  on('command.run', () => ({ text: undefined }))
+  const controls: Record<string, unknown>[] = []
+  on('tool.call', { tool: 'mcp__overseer__control' }, (_, e) => {
+    const { agent, op, value } = e as unknown as Record<string, unknown>
+    controls.push({ agent, op, ...(value !== undefined && { value }) })
+    return { result: JSON.stringify({ ok: true, via: op === 'model' ? 'turn/interrupt' : 'override', note: 'done by Overseer' }) }
+  })
+  const sent: unknown[] = []
+  on('session.send', (_, e) => (sent.push(e), { isDelivered: true }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await overseerWrites($, { a1: done('a1', 'COUNTED'), c1: agent('c1', { kind: 'codex', codex: { threadId: 'th1', turnId: 'tu1', isAlive: true, cwd: CWD } }) })
+  const item = (id: string, agentId: string, op: string, value?: string) =>
+    files.set(`${HOME}/.clawd/inbox/${SESSION}/${id}.json`, JSON.stringify({ type: 'subagent', id, op, agentId, ...(value && { value }) }))
+  item('s1', 'c1', 'model', 'gpt-6.2-sol')
+  item('s2', 'a1', 'pause')
+  item('s3', 'a1', 'message', 'Reply AGAIN')
+  await $.command.run(typed('clawd', 'handle'))
+  await settle()
+  const answer = (id: string) => JSON.parse(files.get(`${HOME}/.clawd/answers/${id}.json`)!) as { ok: boolean; via: string; note: string }
+
+  expect(answer('s1')).toEqual({ ok: true, via: 'overseer turn/interrupt', note: 'done by Overseer' })
+  expect(answer('s3').via).toBe('overseer override')
+  expect(controls).toEqual([{ agent: 'c1', op: 'model', value: 'gpt-6.2-sol' }, { agent: 'a1', op: 'pause' }, { agent: 'a1', op: 'send', value: 'Reply AGAIN' }])
+  // Overseer delivered it; Clawd neither sends it again nor writes its own marks
+  expect(sent).toEqual([])
+  expect(files.has(`${SUB}/steer.json`)).toBe(false)
+  expect(files.has(`${SUB}/pause-a1`)).toBe(false)
+
+  files.set(CONTROL, JSON.stringify({ takenOver: false }))
+  await $.command.run(typed('clawd', 'status'))
+  await $.command.run(typed('clawd', 'off'))
+  expect(controls.slice(3)).toEqual([{ agent: 'c1', op: 'model', value: 'default' }, { agent: 'a1', op: 'resume' }])
+})
+
+test('a session without Overseer says so in its copy, for clawdctl', async ($, on) => {
+  const files = new Map<string, string>()
+  engine(on, files, noWait)
+  on('command.run', () => ({ text: undefined }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await $.command.run(typed('clawd', 'status'))
+  await $.command.run(typed('clawd', 'off'))
+
+  expect(JSON.parse(files.get(`${SUB}/agents.json`)!)).toMatchObject({ overseer: false, agents: [] })
 })
 
 test('a subagent that stops moving is reported stuck once; one the bot paused is not', { plugins: [overseer] }, async ($, on) => {
