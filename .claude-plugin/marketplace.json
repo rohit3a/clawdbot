@@ -11,11 +11,11 @@
         "source": "git-subdir",
         "url": "https://github.com/rohit3a/clawdbot.git",
         "path": "plugins/clawd",
-        "ref": "v0.7.0",
-        "sha": "f524871b1c8dd0a8066e07e3867793f84e509fc1"
+        "ref": "v0.8.0",
+        "sha": "38cef08dabd942ba1d8eecf4a661cba6c97b3ed2"
       },
       "description": "Let a bot such as Grok Bot take over a Claude Code session: questions, permissions, steering.",
-      "version": "0.7.0"
+      "version": "0.8.0"
     }
   ],
   "metadata": {
