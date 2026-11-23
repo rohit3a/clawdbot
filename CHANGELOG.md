@@ -9,7 +9,8 @@
 - On Linux, scheduled tasks are persistent systemd user timers, kept in unit files under `~/.config/systemd/user/`. They survive a reboot. A task whose time passed while the computer was off runs when your user's systemd starts again: at boot with lingering on (`loginctl enable-linger`), otherwise at login. Running or cancelling a task removes its files. Tasks scheduled with 0.8.0 still go away at a reboot.
 - A scheduled task runs with the `CLAWD_HOME` it was scheduled under, on Linux and macOS.
 - `scripts/release.mjs` tags a version that the PR already set without making an empty commit. Any failing check stops the release, puts the version files back, and commits nothing.
-- The docs say plainly that Windows is not supported.
+- CI runs the mod tests on Claude Code 2.1.325 and 2.1.330.
+- The README, the Grok instructions and the skills cover the changes above. They also say plainly that Windows is not supported, and why Codex agents can't be paused.
 
 ## 0.8.0
 

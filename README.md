@@ -201,7 +201,7 @@ claude plugin install overseer@overseer
 claude plugin install overseer-courier@overseer
 ```
 
-The courier lets you message subagents from Overseer's own pane; Clawd does not need it. Without Overseer, `subagents` says so and names these commands. A session picks Overseer up when it next starts.
+With Overseer 0.4.0 or later and its courier, the bot steers through Overseer's own control, as its pane does. The courier is what lets the bot steer a finished Claude subagent its message wakes. Overseer 0.3.0 still works, with the limits below. Without Overseer, `subagents` says so and names these commands. It also says when Overseer is installed but turned off, or not running in that session. A session picks Overseer up when it next starts.
 
 ```bash
 clawdctl subagents api-fix
@@ -223,13 +223,17 @@ Steering a subagent needs the session taken over, like steering the session itse
 | Command | Claude subagent | Codex agent |
 | --- | --- | --- |
 | `send <text>` | running: arrives with its next request. Finished: wakes it under the same id, with its history | running: joins the current turn. Finished: continues the same Codex thread, through Overseer's own `codex` tool |
-| `model <m>`, `effort <e>` | from its next request | the running turn at once; a finished one at the bot's next message |
-| `pause`, `resume` | holds before its next request until resumed, stopped or released | not offered |
+| `model <m>`, `effort <e>` | from its next request | the running turn at once (see below); a finished one from its next turn |
+| `pause`, `resume` | holds before its next request until resumed, stopped or released | not offered: Codex has no pause, only stopping the turn |
 | `stop` | ends at its next request | stops the running turn |
 
-Each command answers with what was done and how (`via`). A message from the bot reaches the subagent marked as the person's, and the parent session is told in a line of its own, so it trusts the subagent's report of it.
+Each command answers with what was done and how (`via`). Through Overseer 0.4.0 that reads `overseer override`, `overseer overseer-courier`, `overseer turn/settings/update` or `overseer turn/interrupt`. A message from the bot reaches the subagent marked as the person's, and the parent session is told in a line of its own, so it trusts the subagent's report of it.
 
-A session the bot holds sends a `subagent` event when one of its subagents finishes (with its answer), fails, is stopped, or makes no new step for 10 minutes. Overseer's pane shows none of the bot's pauses or overrides; `subagents` does (`next`, `pausedByBot`, `stopping`).
+Codex changes effort in a running turn in place, but it refuses some model switches mid-turn (for example from `gpt-6.1-terra` to `gpt-6-luna`). Through Overseer 0.4.0 a refused switch stops the turn, and a new turn continues on the new model (`via: overseer turn/interrupt`). With Overseer 0.3.0 only Overseer sees Codex's answer, so the command says the change is unconfirmed. Either way, the bot's next message to that agent uses it.
+
+When the bot hands the session back, it gives back what it set through Overseer 0.4.0: pauses are resumed and model and effort go back to the agent's own. A Codex turn that already moved to a new model stays on it.
+
+A session the bot holds sends a `subagent` event when one of its subagents finishes (with its answer), fails, is stopped, or makes no new step for 10 minutes. Through Overseer 0.4.0, Overseer's pane shows the bot's changes like its own. With 0.3.0 it shows none of them. Either way `subagents` shows them (`next`, `pausedByBot`, `stopping`).
 
 ## How it works
 
@@ -249,16 +253,18 @@ An idle session reads only its own control file, every two seconds, and writes `
 
 ## Limits
 
-- Tested on Linux and macOS. Windows is untested.
+- Linux and macOS only. Windows is not supported: scheduled tasks need launchd or systemd, and clawdctl's screen reads, `start` and its process checks assume a POSIX system. Clawd has not been tried in WSL.
 - A held ask waits as long as it takes. Your bot decides when to give up and answer.
 - Screen capture reads background sessions, and interactive ones in tmux, WezTerm, iTerm2 or Terminal. Other terminals (GNOME Terminal, a plain SSH login) get the session's own account instead of its screen.
 - Model, effort and permission mode set by the bot last while it has the session. Released, the session goes back to its own. The bot can't set plan, auto or bypass mode.
 - Background sessions need a trusted folder.
 - PR and CI status need the `gh` CLI signed in on the computer.
 - The cost and the budget need a host that keeps a cost ledger. The terminal always has one.
-- On Linux, scheduled tasks are systemd user timers, and a reboot clears them. On macOS they survive a reboot and run at wake if the Mac slept through them.
+- Scheduled tasks survive a reboot. On Linux they are persistent systemd user timers: a task whose time passed while the computer was off runs once your user's systemd starts. That happens at boot if lingering is on (`loginctl enable-linger`), otherwise at your next login. On macOS they run at wake if the Mac slept through them. Tasks scheduled on Linux before 1.0.0 still go away at a reboot.
 - A session waits up to 20 minutes for an AskGrok answer. After that the answer arrives as a message.
-- Subagents need Overseer. A Claude subagent the bot's own message woke runs outside the mod's sight until it finishes: model, effort, pause and stop do not reach that run. Codex agents can't be paused.
+- Subagents need Overseer. With Overseer 0.3.0, or 0.4.0 without its courier running, a Claude subagent the bot's own message woke runs outside the mod's sight until it finishes: model, effort, pause and stop do not reach that run. Overseer 0.4.0 with its courier closes that gap.
+- Codex agents can't be paused. Codex's app-server has no pause, only stopping the turn, and an emulated pause would lose the tool call the turn is in. Stop and a later message do the same job.
+- A Codex model switch that Codex refuses mid-turn costs that turn: through Overseer 0.4.0 the turn is stopped and continued on the new model, losing whatever was in flight.
 
 ## Tests and releases
 
@@ -275,10 +281,10 @@ The first runs the mod's tests against Claude Code itself; the second runs clawd
 To cut a release, add a section for the version to `CHANGELOG.md`, commit it, then on `main`:
 
 ```bash
-node scripts/release.mjs 0.3.0
+node scripts/release.mjs 1.0.0
 ```
 
-It sets the version, validates and tests the plugin, tags the release, pins the marketplace to it, pushes, and publishes the GitHub release. `--dry-run` stops before committing.
+It sets the version (or keeps it, when the merged PR already set it), validates and tests the plugin, tags the release, pins the marketplace to it, pushes, and publishes the GitHub release. If any check fails, it puts the version files back and commits nothing. `--dry-run` stops before committing.
 
 ## License
 

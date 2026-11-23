@@ -9,6 +9,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
+        claude: ['2.1.325', '2.1.330']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -18,7 +19,7 @@ jobs:
       - name: clawdctl
         run: node --test tests/*.test.mjs
       - name: Claude Code
-        run: npm install -g @anthropic-ai/claude-code@2.1.325
+        run: npm install -g @anthropic-ai/claude-code@${{ matrix.claude }}
       - name: Validate the marketplace and the plugin
         run: |
           claude plugin validate .

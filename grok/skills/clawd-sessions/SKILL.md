@@ -45,7 +45,7 @@ Off unless the user turns it on. Only when the user asks for a budget on a sessi
 Only when the user asks for it: `grok '<X>' on` lets that session ask you for help (6 requests an hour by default, `--per-hour n` to change). The user can also type `/clawd grok on` in the session. `grok '<X>' off` stops it.
 
 ## Later
-"Run this tonight", "at 9 tomorrow": `schedule --at '<time>' --folder '<dir>' --prompt '<task>' --name '<n>' --model <m> --effort <e>` (add `--mode babysit` if asked). At is `21:30` (the next one), `+90m`, `+2h`, or `2026-11-16T09:00`, in the computer's time zone. A background session starts then, taken over by you, and a `scheduled` event brings its name and Remote Control link. `schedules` lists them, `unschedule <id>` cancels. On Linux a reboot clears pending tasks.
+"Run this tonight", "at 9 tomorrow": `schedule --at '<time>' --folder '<dir>' --prompt '<task>' --name '<n>' --model <m> --effort <e>` (add `--mode babysit` if asked). At is `21:30` (the next one), `+90m`, `+2h`, or `2026-11-16T09:00`, in the computer's time zone. A background session starts then, taken over by you, and a `scheduled` event brings its name and Remote Control link. `schedules` lists them, `unschedule <id>` cancels. Pending tasks survive a reboot. One whose time passed while the computer was off runs when it is back: on Linux at boot with lingering on, otherwise at the user's next login; on a Mac at wake.
 
 ## Watch
 - "What did it say / what is it doing": `peek '<X>' --count 6` and summarise its last messages in two or three lines. Each message holds up to 8,000 characters; one marked `truncated` is longer still. If its last reply puts a decision to the user, follow clawd-event, "Decisions in a reply".
@@ -60,13 +60,13 @@ A session whose status is `waiting: dialog open` sits at a panel such as /usage,
 "How much usage is left", "when does my limit reset": `usage` on that computer. Report each of `limits` in one line: `label`, `percentUsed`, and `resetsAt` in the user's time zone. A reading under 5 minutes old is used as it is; `--fresh` reads /usage again in a throwaway session that makes no model request, about 10 seconds. A "not trusted" refusal names the fix: relay it. The limits are the account's, so one computer is enough.
 
 ## Subagents
-A session's subagents are the Claude subagents (Agent tool) and Codex agents it started. Clawd sees them through Overseer; without it, `subagents` refuses with the install commands: relay them, and offer to run them only after the user's yes (clawd-setup).
+A session's subagents are the Claude subagents (Agent tool) and Codex agents it started. Clawd sees them through Overseer. Without it, `subagents` refuses with the install commands: relay them, and offer to run them only after the user's yes (clawd-setup). If Overseer is installed but turned off, or not running in that session, the refusal says so and names the fix: relay it.
 - "What are its subagents doing": `subagents '<X>'`. One line each: `name`, `kind`, `model`, `status`, `steps`, and `activity` for a running one. `pausedByBot`, `next` (a model or effort you set) and `stopping` show your own steering. A `note` says why the list is empty or stale.
 - "What did it say": `subagent '<X>' '<id or name>' --count 6`. Sum up its last entries; `prompt` is the task its parent gave it.
 - Steering needs the session taken over, as for the session itself. Name the subagent by id, the start of its id, or its name.
   - Message: `subagent '<X>' '<id>' send '<text>'`. Pass the user's words. A running one gets it with its next request (Codex: in its current turn); a finished one wakes under the same id with its history. Its answer arrives as a `subagent` event.
-  - Model or effort: `subagent '<X>' '<id>' model <m>` or `effort <level>`.
-  - Pause and resume: `subagent '<X>' '<id>' pause`, then `resume`. Claude subagents only. A paused one waits until you resume, stop or release the session.
+  - Model or effort: `subagent '<X>' '<id>' model <m>` or `effort <level>`. For a running Codex turn, the `note` says how it went: switched in place, or the turn stopped and continued on the new model (`via` ends in `turn/interrupt`), or unconfirmed. Relay that in one line; never say a change took effect when the note says it is unconfirmed.
+  - Pause and resume: `subagent '<X>' '<id>' pause`, then `resume`. Claude subagents only, because Codex has no pause: offer Stop instead. A paused one waits until you resume, stop or release the session.
   - Stop: `subagent '<X>' '<id>' stop`. A Claude subagent ends at its next request; a Codex agent's running turn stops. A message continues either later.
 - clawdctl prints `done` with a `note` on what happened, or `queued` when the session didn't answer within seconds: say it will apply when the session next checks. A refusal is one sentence: relay it.
 

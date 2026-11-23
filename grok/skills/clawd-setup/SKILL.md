@@ -10,7 +10,7 @@ description: >-
 Follow clawd-rules. Install only after the user's yes, per computer.
 
 ## Needs
-Claude Code 2.1.325 or later (`claude --version`), Node 18 or later (`node --version`), macOS or Linux. Windows is not supported yet: say so and skip it.
+Claude Code 2.1.325 or later (`claude --version`), Node 18 or later (`node --version`), macOS or Linux. Windows is not supported, and Clawd has not been tried in WSL: say so and skip that computer.
 
 ## Install on a computer
 Run on that computer, one step at a time, and stop on the first error:
