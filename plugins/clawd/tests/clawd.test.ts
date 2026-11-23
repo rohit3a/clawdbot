@@ -627,6 +627,54 @@ test('the bot\'s message goes to a Claude subagent by session.send, to a finishe
   psOutput = ''
 })
 
+test('with an Overseer that takes control, steering goes through it, and release puts back what the bot set', { plugins: [overseer] }, async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, noWait)
+  on('command.run', () => ({ text: undefined }))
+  const controls: Record<string, unknown>[] = []
+  on('tool.call', { tool: 'mcp__overseer__control' }, (_, e) => {
+    const { agent, op, value } = e as unknown as Record<string, unknown>
+    controls.push({ agent, op, ...(value !== undefined && { value }) })
+    return { result: JSON.stringify({ ok: true, via: op === 'model' ? 'turn/interrupt' : 'override', note: 'done by Overseer' }) }
+  })
+  const sent: unknown[] = []
+  on('session.send', (_, e) => (sent.push(e), { isDelivered: true }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await overseerWrites($, { a1: done('a1', 'COUNTED'), c1: agent('c1', { kind: 'codex', codex: { threadId: 'th1', turnId: 'tu1', isAlive: true, cwd: CWD } }) })
+  const item = (id: string, agentId: string, op: string, value?: string) =>
+    files.set(`${HOME}/.clawd/inbox/${SESSION}/${id}.json`, JSON.stringify({ type: 'subagent', id, op, agentId, ...(value && { value }) }))
+  item('s1', 'c1', 'model', 'gpt-6.2-sol')
+  item('s2', 'a1', 'pause')
+  item('s3', 'a1', 'message', 'Reply AGAIN')
+  await $.command.run(typed('clawd', 'handle'))
+  await settle()
+  const answer = (id: string) => JSON.parse(files.get(`${HOME}/.clawd/answers/${id}.json`)!) as { ok: boolean; via: string; note: string }
+
+  expect(answer('s1')).toEqual({ ok: true, via: 'overseer turn/interrupt', note: 'done by Overseer' })
+  expect(answer('s3').via).toBe('overseer override')
+  expect(controls).toEqual([{ agent: 'c1', op: 'model', value: 'gpt-6.2-sol' }, { agent: 'a1', op: 'pause' }, { agent: 'a1', op: 'send', value: 'Reply AGAIN' }])
+  // Overseer delivered it; Clawd neither sends it again nor writes its own marks
+  expect(sent).toEqual([])
+  expect(files.has(`${SUB}/steer.json`)).toBe(false)
+  expect(files.has(`${SUB}/pause-a1`)).toBe(false)
+
+  files.set(CONTROL, JSON.stringify({ takenOver: false }))
+  await $.command.run(typed('clawd', 'status'))
+  await $.command.run(typed('clawd', 'off'))
+  expect(controls.slice(3)).toEqual([{ agent: 'c1', op: 'model', value: 'default' }, { agent: 'a1', op: 'resume' }])
+})
+
+test('a session without Overseer says so in its copy, for clawdctl', async ($, on) => {
+  const files = new Map<string, string>()
+  engine(on, files, noWait)
+  on('command.run', () => ({ text: undefined }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await $.command.run(typed('clawd', 'status'))
+  await $.command.run(typed('clawd', 'off'))
+
+  expect(JSON.parse(files.get(`${SUB}/agents.json`)!)).toMatchObject({ overseer: false, agents: [] })
+})
+
 test('a subagent that stops moving is reported stuck once; one the bot paused is not', { plugins: [overseer] }, async ($, on) => {
   const files = new Map([[CONTROL, takenOver()], [`${SUB}/pause-a2`, '1']])
   engine(on, files, noWait)

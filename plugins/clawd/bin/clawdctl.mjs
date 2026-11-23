@@ -575,14 +575,19 @@ function overseerInfo() {
   const rows = readJson(path.join(cfg, 'plugins', 'installed_plugins.json'))?.plugins ?? {};
   const pick = (name) => { const r = rows[name]; return Array.isArray(r) ? r.find((x) => x.scope === 'user') ?? r[0] : undefined; };
   const o = pick('overseer@overseer');
-  return { installed: !!o, version: o?.version ?? null, courier: !!pick('overseer-courier@overseer') };
+  const enabled = readJson(path.join(cfg, 'settings.json'))?.enabledPlugins?.['overseer@overseer'] !== false;
+  return { installed: !!o, ...(o && !enabled && { enabled: false }), version: o?.version ?? null, courier: !!pick('overseer-courier@overseer') };
 }
 
+// the session's own copy says whether Overseer is loaded there (overseer: false when it is not)
 function subagentsOf(a) {
   pruneSubagents();
   const mirror = readJson(sub('subagents', a.sessionId, 'agents.json'));
   if (mirror?.overseer) return { mirror };
-  if (!overseerInfo().installed) refuse(`Overseer is not installed on this computer, so subagents can't be watched or steered. To add it: ${OVERSEER_INSTALL}. Sessions started after that have it.`);
+  const info = overseerInfo();
+  if (!info.installed) refuse(`Overseer is not installed on this computer, so subagents can't be watched or steered. To add it: ${OVERSEER_INSTALL}. Sessions started after that have it.`);
+  if (info.enabled === false) refuse('Overseer is installed but turned off, so subagents can\'t be watched or steered. claude plugin enable overseer@overseer turns it on; sessions started after that have it.');
+  if (mirror?.overseer === false) refuse('Overseer is not running in this session (it started before Overseer was installed, or with it turned off), so its subagents can\'t be watched or steered. A session started now has it.');
   return { mirror: undefined, note: 'No subagents seen in this session. Overseer is installed, but a session opened before it or before Clawd 0.8.0 reports none until it is restarted.' };
 }
 

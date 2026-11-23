@@ -79,7 +79,8 @@ let lastReportAt = 0
 let lastFlushAt = 0
 let flushGap = FLUSH_EVERY_MS
 let holding: string | undefined
-let ticking = false
+let ticking: Promise<void> | undefined
+let tickAgain = false
 // events still in the outbox; a released session keeps flushing until they are gone, then is idle
 let unsent = false
 let claimChecked = false
@@ -360,6 +361,7 @@ async function sessionAccount($: $, command: string): Promise<string> {
 const OVERSEER_AGENTS = { plugin: 'overseer', key: 'agents' } as const
 const OVERSEER_UI = { plugin: 'overseer', key: 'ui' } as const
 const OVERSEER_CODEX = 'mcp__overseer__codex'
+const OVERSEER_CONTROL = 'mcp__overseer__control'
 const MIRROR_GAP_MS = 1000
 const THREAD_KEPT = 40
 const ACTIVE = new Set(['starting', 'review', 'running', 'paused'])
@@ -368,6 +370,7 @@ const FRAME = '[Message from the person, sent through Clawd Bot]'
 
 let agentsSeen: Record<string, OverseerAgent> | undefined
 let overseerChecked = false
+let overseerMissingSaid = false
 let mirrorDue = false
 let lastMirrorAt = 0
 let subDirMade = false
@@ -377,6 +380,9 @@ const statusSeen = new Map<string, string>()
 const progressSeen = new Map<string, { mark: string; at: number }>()
 const stuckSaid = new Set<string>()
 const stoppedByBot = new Set<string>()
+let overseerControlMissing = false
+// what the bot set through Overseer's control, per subagent, to undo at release
+const steeredByOverseer = new Map<string, Set<'model' | 'effort' | 'pause'>>()
 
 const cut = (t: string | undefined, n: number) => (t === undefined ? undefined : t.length > n ? `${t.slice(0, n)}…` : t)
 const fileSafe = (id: string) => id.replace(/[^\w.-]/g, '_')
@@ -413,11 +419,12 @@ function compact(a: OverseerAgent) {
   }
 }
 
-async function writeMirror($: $): Promise<void> {
+// overseer: false says Overseer is not loaded in this session, so clawdctl can say why there are no subagents
+async function writeMirror($: $, overseer = true): Promise<void> {
   mirrorDue = false
   lastMirrorAt = Date.now()
   const agents = Object.values(agentsSeen ?? {}).map(compact)
-  await $.fs.write(`${await subDir($)}/agents.json`, JSON.stringify({ sessionId: await myId($), pid, at: Date.now(), overseer: true, agents }))
+  await $.fs.write(`${await subDir($)}/agents.json`, JSON.stringify({ sessionId: await myId($), pid, at: Date.now(), overseer, agents }))
 }
 
 function sawAgents($: $, agents: Record<string, OverseerAgent> | undefined): void {
@@ -427,19 +434,33 @@ function sawAgents($: $, agents: Record<string, OverseerAgent> | undefined): voi
   void subagentEnds($).catch(() => undefined)
 }
 
-// Overseer is loaded when it has written its state; the first tick looks once, so even a session whose
-// subagents ran before this mod loaded has them listed
+// Overseer is loaded when it has written its state; each tick looks until it has, so even a session whose
+// subagents ran before this mod loaded has them listed. Until then the copy says Overseer is not here.
 async function lookForOverseer($: $): Promise<void> {
-  overseerChecked = true
+  // its state.set already reached sawAgents
+  if (agentsSeen !== undefined) {
+    overseerChecked = true
+    return
+  }
   let reads: Promise<[{ version: number }, { value: Record<string, OverseerAgent> | undefined; version: number }]>
   try {
     reads = Promise.all([$.state.get(OVERSEER_UI), $.state.get(OVERSEER_AGENTS)])
   } catch {
     // a build without $.state
+    overseerChecked = true
     return
   }
   const [ui, agents] = await reads.catch(() => [{ version: 0 }, { value: undefined, version: 0 }] as const)
-  if (ui.version === 0 && agents.version === 0) return
+  if (agentsSeen !== undefined) {
+    overseerChecked = true
+    return
+  }
+  if (ui.version === 0 && agents.version === 0) {
+    if (!overseerMissingSaid) await writeMirror($, false)
+    overseerMissingSaid = true
+    return
+  }
+  overseerChecked = true
   agentsSeen = agents.value ?? {}
   for (const a of Object.values(agentsSeen)) statusSeen.set(a.id, a.status)
   await writeMirror($)
@@ -477,7 +498,7 @@ async function subagentsStuck($: $): Promise<void> {
     const mark = [a.status, a.steps, a.tokensOut, a.thread?.length, a.thread?.at(-1)?.at, a.activity].join('|')
     const seen = progressSeen.get(a.id)
     // one the bot paused or is stopping waits on the bot: its clock starts again when it goes on
-    const byBot = ['pause', 'stop', 'holding'].some(k => marks.has(`${k}-${fileSafe(a.id)}`)) || stoppedByBot.has(a.id)
+    const byBot = ['pause', 'stop', 'holding'].some(k => marks.has(`${k}-${fileSafe(a.id)}`)) || stoppedByBot.has(a.id) || !!steeredByOverseer.get(a.id)?.has('pause')
     if (!seen || seen.mark !== mark || byBot) {
       progressSeen.set(a.id, { mark, at: now })
       stuckSaid.delete(a.id)
@@ -536,6 +557,52 @@ async function setRuns($: $, d: string, agentId: string, change: { model?: strin
   return next
 }
 
+// Overseer 0.4.0 and later take steering themselves (mcp__overseer__control): the change shows in its pane, a
+// Codex model switch Codex refuses in place still lands (the turn stops and continues), and a finished Claude
+// subagent woken by a message runs where both plugins see it. undefined: this Overseer has no control, or it
+// can't deliver this one, and Clawd does it its own way.
+async function overseerControl($: $, a: OverseerAgent, s: SubagentSteer): Promise<SubagentResult | undefined> {
+  if (overseerControlMissing) return undefined
+  let r: { result?: unknown; deny?: string }
+  try {
+    r = (await $.tool.call({ tool: OVERSEER_CONTROL, agent: a.id, op: s.op === 'message' ? 'send' : s.op, value: s.value } as never)) as typeof r
+  } catch {
+    overseerControlMissing = true
+    return undefined
+  }
+  let answer: (SubagentResult & { code?: string }) | undefined
+  try {
+    answer = typeof r.result === 'string' ? JSON.parse(r.result) : undefined
+  } catch {
+    answer = undefined
+  }
+  if (typeof answer?.ok !== 'boolean') {
+    overseerControlMissing = true
+    return undefined
+  }
+  if (answer.code === 'courier-missing') return undefined
+  if (answer.ok) {
+    const set = steeredByOverseer.get(a.id) ?? new Set()
+    if (s.op === 'model' || s.op === 'effort') set.add(s.op)
+    if (s.op === 'pause') set.add('pause')
+    if (s.op === 'resume') set.delete('pause')
+    steeredByOverseer.set(a.id, set)
+    if (s.op === 'stop') stoppedByBot.add(a.id)
+  }
+  return { ok: answer.ok, reason: answer.reason, via: answer.via ? `overseer ${answer.via}` : 'overseer', note: answer.note }
+}
+
+// at release, what the bot set through Overseer goes back: its own model and effort, and a pause lifted
+async function undoOverseerSteer($: $): Promise<void> {
+  for (const [agent, ops] of steeredByOverseer) {
+    for (const op of ops) {
+      const undo = op === 'pause' ? { op: 'resume' } : { op, value: 'default' }
+      await Promise.resolve($.tool.call({ tool: OVERSEER_CONTROL, agent, ...undo } as never)).catch(() => undefined)
+    }
+  }
+  steeredByOverseer.clear()
+}
+
 async function subagentOp($: $, s: SubagentSteer): Promise<SubagentResult> {
   let agents: Record<string, OverseerAgent> | undefined
   try {
@@ -545,6 +612,8 @@ async function subagentOp($: $, s: SubagentSteer): Promise<SubagentResult> {
   }
   const a = (agents ?? agentsSeen ?? {})[s.agentId]
   if (!a) return { ok: false, reason: 'Overseer has no subagent with that id in this session now.' }
+  const viaOverseer = await overseerControl($, a, s)
+  if (viaOverseer) return viaOverseer
   const d = await subDir($)
   const mark = fileSafe(a.id)
   const value = s.value ?? ''
@@ -585,7 +654,13 @@ async function subagentOp($: $, s: SubagentSteer): Promise<SubagentResult> {
   if (s.op === 'model' || s.op === 'effort') {
     const runs = await setRuns($, d, a.id, { [s.op]: value })
     if (turn && (await codexRequest($, 'turn/settings/update', { ...turn, model: runs.model ?? null, effort: runs.effort ?? null }))) {
-      return { ok: true, via: 'codex turn/settings/update', note: 'Applied to the running turn in place, and kept for the next message the bot sends it.' }
+      // Codex answers Overseer, not Clawd: an effort change lands in place, but Codex refuses some model switches
+      // mid-turn, and only Overseer 0.4.0's control can tell and continue the turn on the new model
+      return {
+        ok: true,
+        via: 'codex turn/settings/update',
+        note: `Sent to the running turn, unconfirmed: Codex applies effort in place but can refuse a switch to another model mid-turn. Kept for the next message the bot sends it either way.${s.op === 'model' ? ' Overseer 0.4.0 or later confirms it, and continues the turn on the new model if Codex refuses.' : ''}`,
+      }
     }
     return { ok: true, via: 'next message', note: 'Applies to the next turn the bot starts with a message.' }
   }
@@ -666,53 +741,69 @@ async function drainInbox($: $): Promise<void> {
   }
 }
 
-async function tick($: $): Promise<void> {
-  if (ticking) return
-  ticking = true
-  try {
-    const was = announced
-    control = await readControl($)
-    announced = control
-    if (!overseerChecked) await lookForOverseer($).catch(() => undefined)
-    if (mirrorDue) await writeMirror($).catch(() => undefined)
-    const optIn = await readJson<GrokOptIn>($, `${await dir($)}/grok/${await myId($)}.json`)
-    const grokNow = optIn?.enabled ? optIn : undefined
-    if (!!grokNow !== !!grok) $.ui.invalidate('tool.list')
-    grok = grokNow
-    if (!was && control) {
-      showStatus($)
-      await writeLive($)
-      await emit($, 'takeover', { by: control.by })
-      // a terminal session gets a Remote Control link so the person can open it from the phone or the web
-      if (await onTerminal($)) wantRemote = true
-    } else if (was && !control) {
-      allowedForSession.clear()
-      // what the bot set for subagents lasts only while it has the session
-      if (subDirMade) await $.process.run(['sh', '-c', 'rm -f "$1"/steer.json "$1"/pause-* "$1"/stop-*', 'clawd', await subDir($)]).catch(() => undefined)
-      showStatus($)
-      await removeFiles($, [`${await dir($)}/live/${await myId($)}.json`])
-      await emit($, 'released', {})
-      return
-    } else if (control && (was?.mode !== control.mode || was?.model !== control.model || was?.effort !== control.effort || was?.permissions !== control.permissions)) showStatus($)
-    // a late answer from Grok Bot arrives in the inbox even when nobody has taken the session over
-    if (!control) {
-      if (grok) await drainInbox($)
-      if (unsent) await flush($, false)
-      return
-    }
-    await drainInbox($)
-    const every = control.reportEveryMin
-    if (every && every > 0 && Date.now() - Math.max(lastReportAt, control.since) >= every * 60_000) {
-      lastReportAt = Date.now()
-      const gist = clip(lastAnswer, GIST_CHARS)
-      await emit($, 'progress', { busy, holding: holding ?? null, lastAnswer: gist.text, ...(gist.truncated && { truncated: true }), lastTurnAt })
-    }
-    await subagentsStuck($).catch(() => undefined)
-    await flush($, false)
-    await watchDialog($)
-  } finally {
-    ticking = false
+// One tick at a time. A tick asked for during one (the 2 s clock meeting a /clawd command or a turn's start) runs
+// once more after it, and the caller waits for that, so it acts on what the files say now. Nothing a tick waits
+// on waits for a tick.
+function tick($: $): Promise<void> {
+  if (ticking) {
+    tickAgain = true
+    return ticking
   }
+  ticking = (async () => {
+    try {
+      do {
+        tickAgain = false
+        await tickOnce($)
+      } while (tickAgain)
+    } finally {
+      ticking = undefined
+    }
+  })()
+  return ticking
+}
+
+async function tickOnce($: $): Promise<void> {
+  const was = announced
+  control = await readControl($)
+  announced = control
+  if (!overseerChecked) await lookForOverseer($).catch(() => undefined)
+  if (mirrorDue) await writeMirror($).catch(() => undefined)
+  const optIn = await readJson<GrokOptIn>($, `${await dir($)}/grok/${await myId($)}.json`)
+  const grokNow = optIn?.enabled ? optIn : undefined
+  if (!!grokNow !== !!grok) $.ui.invalidate('tool.list')
+  grok = grokNow
+  if (!was && control) {
+    showStatus($)
+    await writeLive($)
+    await emit($, 'takeover', { by: control.by })
+    // a terminal session gets a Remote Control link so the person can open it from the phone or the web
+    if (await onTerminal($)) wantRemote = true
+  } else if (was && !control) {
+    allowedForSession.clear()
+    // what the bot set for subagents lasts only while it has the session
+    if (subDirMade) await $.process.run(['sh', '-c', 'rm -f "$1"/steer.json "$1"/pause-* "$1"/stop-*', 'clawd', await subDir($)]).catch(() => undefined)
+    await undoOverseerSteer($)
+    showStatus($)
+    await removeFiles($, [`${await dir($)}/live/${await myId($)}.json`])
+    await emit($, 'released', {})
+    return
+  } else if (control && (was?.mode !== control.mode || was?.model !== control.model || was?.effort !== control.effort || was?.permissions !== control.permissions)) showStatus($)
+  // a late answer from Grok Bot arrives in the inbox even when nobody has taken the session over
+  if (!control) {
+    if (grok) await drainInbox($)
+    if (unsent) await flush($, false)
+    return
+  }
+  await drainInbox($)
+  const every = control.reportEveryMin
+  if (every && every > 0 && Date.now() - Math.max(lastReportAt, control.since) >= every * 60_000) {
+    lastReportAt = Date.now()
+    const gist = clip(lastAnswer, GIST_CHARS)
+    await emit($, 'progress', { busy, holding: holding ?? null, lastAnswer: gist.text, ...(gist.truncated && { truncated: true }), lastTurnAt })
+  }
+  await subagentsStuck($).catch(() => undefined)
+  await flush($, false)
+  await watchDialog($)
 }
 
 // clawdctl start leaves a claim for its folder; the new session takes it before its first prompt runs
