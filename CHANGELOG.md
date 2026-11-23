@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0
+
+- Subagents, through [Overseer](https://github.com/rohit3a/overseer) 0.3.0 or later, for Claude subagents and Codex agents alike. `clawdctl subagents <session>` lists a session's subagents as JSON: id, name, kind (`claude` or `codex`), model, effort, status, steps, tokens, and last activity. `clawdctl subagent <session> <id> [--count n]` adds the prompt it was given and its recent thread. Without Overseer installed, both say so and name the install commands.
+- `clawdctl subagent <session> <id> send <text> | model <m> | effort <e> | pause | resume | stop` steers one, while the bot has the session. A message reaches a running subagent with its next request, or a running Codex turn at once (`turn/steer`). It wakes a finished one under the same id with its history; a finished Codex agent continues its thread through Overseer's own `codex` tool. Model and effort apply from a Claude subagent's next request, and to a running Codex turn at once. Pause holds a Claude subagent before its next request until resumed. Stop ends a Claude subagent at its next request, or interrupts the running Codex turn. Each answers with what it did and how.
+- A session the bot holds sends a `subagent` event when one of its subagents finishes (with its answer), fails, is stopped, or makes no new step for 10 minutes (`CLAWD_SUBAGENT_STUCK_MS` changes that). A permission ask from a subagent names it (`subagentName`).
+- `sessions` counts each session's subagents (`subagents: { running, total }`).
+- MCP: `list_subagents`, `read_subagent`, `message_subagent` and `steer_subagent`.
+- Clawd reads Overseer's state and drives its Codex bridge; it changes nothing in Overseer. Every session keeps a copy of its subagent list in `~/.clawd/subagents/<session>/agents.json`.
+- The mod honours `CLAWD_HOME`, as clawdctl already did.
+- The events routine prompt is now v7, with the `subagent` event.
+
 ## 0.7.0
 
 - `clawdctl screen <session>` reads the dialog or panel a session shows (/usage, /cost, /status, a model picker) and prints it as JSON: `session`, `status`, `text`, `capturedAt`, and `source`, where the text came from. `--dismiss` then sends Escape, only while a dialog is open, and says whether it closed. `--full` returns the whole screen.

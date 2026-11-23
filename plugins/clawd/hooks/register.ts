@@ -6,7 +6,44 @@ type Mode = 'handle' | 'babysit'
 type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 type Permissions = 'acceptEdits' | 'dontAsk'
 type Control = { takenOver: boolean; mode: Mode; by: 'bot' | 'you'; since: number; reportEveryMin?: number; model?: string; effort?: Effort; permissions?: Permissions; budgetUsd?: number; ciWake?: boolean }
-type Steer = { type: 'message'; text: string } | { type: 'interrupt' } | { type: 'remote' }
+type SubagentOp = 'message' | 'model' | 'effort' | 'pause' | 'resume' | 'stop'
+type SubagentSteer = { type: 'subagent'; id: string; op: SubagentOp; agentId: string; value?: string }
+type Steer = { type: 'message'; text: string } | { type: 'interrupt' } | { type: 'remote' } | SubagentSteer
+
+// Overseer (rohit3a/overseer) keeps every subagent of the session in its host-held state. Any plugin may read
+// another's state, so this copy of its shape is all Clawd needs to watch Claude and Codex subagents alike.
+type OverseerMsg = { id: string; at: number; by: string; text: string; state?: string }
+type OverseerAgent = {
+  id: string
+  kind: 'claude' | 'codex'
+  name: string
+  type: string
+  description: string
+  parentId?: string
+  status: string
+  startedAt: number
+  endedAt?: number
+  spawnPrompt: string
+  model?: string
+  effort?: string
+  override?: { model?: string; effort?: string }
+  isPaused?: boolean
+  isStopping?: boolean
+  steps: number
+  tokensIn: number
+  tokensOut: number
+  activity: string
+  thread: OverseerMsg[]
+  error?: string
+  codex?: { threadId?: string; turnId?: string; isAlive: boolean; cwd: string }
+}
+declare module 'claude-code' {
+  interface PluginState {
+    overseer: { agents: Record<string, OverseerAgent>; ui: Record<string, unknown> }
+  }
+}
+// what the bot set for a subagent: model and effort from its next request
+type SubagentRuns = Record<string, { model?: string; effort?: string }>
 type GrokOptIn = { enabled: boolean; perHour?: number }
 type RequestAnswer = { result?: string; declined?: string }
 type GitSummary = { branch?: string; commits?: string[]; changed?: { files: number; insertions: number; deletions: number }; pr?: { number: number; url: string; state: string; checks?: { pass: number; fail: number; pending: number } } }
@@ -95,16 +132,19 @@ function mediaIn(text: string): string[] {
 const sh = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
 
 let pid: number | undefined
+// CLAWD_HOME moves ~/.clawd, as it does for clawdctl
+let clawdHome: string | undefined
 
 async function dir($: $): Promise<string> {
   if (!home) {
     // the shell's parent is this session's process; its pid lets clawdctl tell a live ask from one left by a dead session
-    const [h = '', p = '', c = ''] = (await $.process.run(['sh', '-c', 'printf "%s\\n%s\\n%s" "$HOME" "$PPID" "${CLAUDE_CONFIG_DIR:-}"'])).stdout.split('\n')
+    const [h = '', p = '', c = '', d = ''] = (await $.process.run(['sh', '-c', 'printf "%s\\n%s\\n%s\\n%s" "$HOME" "$PPID" "${CLAUDE_CONFIG_DIR:-}" "${CLAWD_HOME:-}"'])).stdout.split('\n')
     home = h
     pid = Number(p) || undefined
     configDir = c || `${h}/.claude`
+    clawdHome = d || `${h}/.clawd`
   }
-  return `${home}/.clawd`
+  return clawdHome ?? `${home}/.clawd`
 }
 
 async function myId($: $): Promise<string> {
@@ -309,8 +349,305 @@ async function sessionAccount($: $, command: string): Promise<string> {
   return lines.join('\n')
 }
 
+// ---------- subagents, through Overseer ----------
+//
+// Overseer records each subagent (Claude or Codex) in its state; this session copies that record to
+// subagents/<session>/agents.json for clawdctl whenever Overseer writes it, at most once a second. The bot's
+// steering comes in through the inbox and is applied with the calls Overseer itself uses: session.send for a
+// Claude subagent (what overseer-courier calls), the Claude subagent's own requests for model, effort, pause and
+// stop, and for a Codex subagent Overseer's Codex tool and its Codex bridge.
+
+const OVERSEER_AGENTS = { plugin: 'overseer', key: 'agents' } as const
+const OVERSEER_UI = { plugin: 'overseer', key: 'ui' } as const
+const OVERSEER_CODEX = 'mcp__overseer__codex'
+const MIRROR_GAP_MS = 1000
+const THREAD_KEPT = 40
+const ACTIVE = new Set(['starting', 'review', 'running', 'paused'])
+const ENDED: Record<string, 'finished' | 'failed' | 'stopped'> = { completed: 'finished', idle: 'finished', failed: 'failed', killed: 'stopped' }
+const FRAME = '[Message from the person, sent through Clawd Bot]'
+
+let agentsSeen: Record<string, OverseerAgent> | undefined
+let overseerChecked = false
+let mirrorDue = false
+let lastMirrorAt = 0
+let subDirMade = false
+// no new step, tokens or thread entry for this long, and a working subagent counts as stuck
+let stuckMs = 10 * 60_000
+const statusSeen = new Map<string, string>()
+const progressSeen = new Map<string, { mark: string; at: number }>()
+const stuckSaid = new Set<string>()
+const stoppedByBot = new Set<string>()
+
+const cut = (t: string | undefined, n: number) => (t === undefined ? undefined : t.length > n ? `${t.slice(0, n)}…` : t)
+const fileSafe = (id: string) => id.replace(/[^\w.-]/g, '_')
+
+async function subDir($: $): Promise<string> {
+  const d = `${await dir($)}/subagents/${await myId($)}`
+  if (!subDirMade) {
+    subDirMade = true
+    await $.process.run(['mkdir', '-p', '-m', '700', d]).catch(() => undefined)
+  }
+  return d
+}
+
+function brief(a: OverseerAgent) {
+  return { id: a.id, name: a.name, kind: a.kind, type: a.type, model: a.model, effort: a.effort, steps: a.steps, tokensIn: a.tokensIn, tokensOut: a.tokensOut }
+}
+
+function compact(a: OverseerAgent) {
+  return {
+    ...brief(a),
+    description: cut(a.description, 300),
+    parentId: a.parentId,
+    status: a.status,
+    startedAt: a.startedAt,
+    endedAt: a.endedAt,
+    spawnPrompt: cut(a.spawnPrompt, 8000),
+    override: a.override,
+    isPaused: a.isPaused,
+    isStopping: a.isStopping,
+    activity: cut(a.activity, 300),
+    error: a.error,
+    codex: a.codex && { threadId: a.codex.threadId, turnId: a.codex.turnId, isAlive: a.codex.isAlive, cwd: a.codex.cwd },
+    thread: (a.thread ?? []).slice(-THREAD_KEPT).map(m => ({ at: m.at, by: m.by, text: cut(m.text, 2000), ...(m.state && { state: m.state }) })),
+  }
+}
+
+async function writeMirror($: $): Promise<void> {
+  mirrorDue = false
+  lastMirrorAt = Date.now()
+  const agents = Object.values(agentsSeen ?? {}).map(compact)
+  await $.fs.write(`${await subDir($)}/agents.json`, JSON.stringify({ sessionId: await myId($), pid, at: Date.now(), overseer: true, agents }))
+}
+
+function sawAgents($: $, agents: Record<string, OverseerAgent> | undefined): void {
+  agentsSeen = agents ?? {}
+  if (Date.now() - lastMirrorAt >= MIRROR_GAP_MS) void writeMirror($).catch(() => undefined)
+  else mirrorDue = true
+  void subagentEnds($).catch(() => undefined)
+}
+
+// Overseer is loaded when it has written its state; the first tick looks once, so even a session whose
+// subagents ran before this mod loaded has them listed
+async function lookForOverseer($: $): Promise<void> {
+  overseerChecked = true
+  let reads: Promise<[{ version: number }, { value: Record<string, OverseerAgent> | undefined; version: number }]>
+  try {
+    reads = Promise.all([$.state.get(OVERSEER_UI), $.state.get(OVERSEER_AGENTS)])
+  } catch {
+    // a build without $.state
+    return
+  }
+  const [ui, agents] = await reads.catch(() => [{ version: 0 }, { value: undefined, version: 0 }] as const)
+  if (ui.version === 0 && agents.version === 0) return
+  agentsSeen = agents.value ?? {}
+  for (const a of Object.values(agentsSeen)) statusSeen.set(a.id, a.status)
+  await writeMirror($)
+}
+
+// a subagent that finished, failed or was stopped while the bot holds the session
+async function subagentEnds($: $): Promise<void> {
+  for (const a of Object.values(agentsSeen ?? {})) {
+    const was = statusSeen.get(a.id)
+    statusSeen.set(a.id, a.status)
+    const ended = ENDED[a.status]
+    if (!control || was === undefined || !ended || !ACTIVE.has(was)) continue
+    // Overseer records a stopped turn as completed; a stop the bot asked for is reported as one
+    const state = stoppedByBot.delete(a.id) && ended === 'finished' ? 'stopped' : ended
+    stuckSaid.delete(a.id)
+    progressSeen.delete(a.id)
+    const answer = [...(a.thread ?? [])].reverse().find(m => m.by === 'agent')?.text
+    const gist = answer ? clip(answer, GIST_CHARS) : undefined
+    await emit($, 'subagent', { state, subagent: brief(a), ...(gist && { answer: gist.text, ...(gist.truncated && { truncated: true }) }), ...(a.error && { error: a.error }) })
+  }
+}
+
+// a working subagent that has not moved for stuckMs, or one paused from the Overseer pane that long; once each time
+async function subagentsStuck($: $): Promise<void> {
+  if (!control || !agentsSeen) return
+  const now = Date.now()
+  const d = await subDir($)
+  const marks = new Set((await $.fs.list(d).catch(() => [])).map(f => f.name))
+  for (const a of Object.values(agentsSeen)) {
+    if (!ACTIVE.has(a.status)) {
+      progressSeen.delete(a.id)
+      stuckSaid.delete(a.id)
+      continue
+    }
+    const mark = [a.status, a.steps, a.tokensOut, a.thread?.length, a.thread?.at(-1)?.at, a.activity].join('|')
+    const seen = progressSeen.get(a.id)
+    // one the bot paused or is stopping waits on the bot: its clock starts again when it goes on
+    const byBot = ['pause', 'stop', 'holding'].some(k => marks.has(`${k}-${fileSafe(a.id)}`)) || stoppedByBot.has(a.id)
+    if (!seen || seen.mark !== mark || byBot) {
+      progressSeen.set(a.id, { mark, at: now })
+      stuckSaid.delete(a.id)
+      continue
+    }
+    if (stuckSaid.has(a.id) || now - seen.at < stuckMs) continue
+    stuckSaid.add(a.id)
+    const minutes = Math.max(1, Math.round((now - seen.at) / 60_000))
+    const reason = a.status === 'paused' || a.isPaused ? `paused from the Overseer pane for ${minutes} min` : `no new step for ${minutes} min${a.activity ? ` (last: ${cut(a.activity, 120)})` : ''}`
+    await emit($, 'subagent', { state: 'stuck', reason, subagent: brief(a), status: a.status })
+  }
+}
+
+async function noteParent($: $, text: string): Promise<void> {
+  try {
+    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } } as never)
+  } catch {
+    // a courtesy to the parent: the message itself went
+  }
+}
+
+// Overseer runs every Codex subagent on one `codex app-server`, fed by its bridge from request files in a private
+// folder. The bridge's feeder names that folder and this session's process in its arguments.
+async function codexInbox($: $): Promise<string | undefined> {
+  if (!pid) return undefined
+  const ps = await $.process.run(['ps', '-A', '-ww', '-o', 'args=']).catch(() => undefined)
+  for (const line of (ps?.stdout ?? '').split('\n')) {
+    const m = /overseer-feeder (\S+) \d+ (\d+)\s*$/.exec(line)
+    if (m && Number(m[2]) === pid) return m[1]
+  }
+  return undefined
+}
+
+// one JSON-RPC request into the bridge, as Overseer writes its own: the request file, then its .ok marker, then
+// a signal that wakes the feeder; the answer goes to Overseer, which ignores an id that is not its own
+async function codexRequest($: $, method: string, params: object): Promise<boolean> {
+  const inbox = await codexInbox($)
+  if (!inbox) return false
+  const name = `${String(Date.now()).padStart(15, '0')}-clawd${Math.random().toString(36).slice(2, 8)}`
+  await $.fs.write(`${inbox}/${name}.json`, `${JSON.stringify({ jsonrpc: '2.0', id: `clawd-${name}`, method, params })}\n`)
+  await $.fs.write(`${inbox}/${name}.ok`, '')
+  const feeder = (await $.fs.read(`${inbox}/feeder.pid`).catch(() => '')).trim()
+  if (/^\d+$/.test(feeder)) await $.process.run(['kill', '-USR1', feeder]).catch(() => undefined)
+  return true
+}
+
+type SubagentResult = { ok: boolean; reason?: string; via?: string; note?: string }
+
+async function setRuns($: $, d: string, agentId: string, change: { model?: string; effort?: string }): Promise<{ model?: string; effort?: string }> {
+  const all = (await readJson<SubagentRuns>($, `${d}/steer.json`)) ?? {}
+  const next = { ...all[agentId], ...change }
+  for (const k of ['model', 'effort'] as const) if (next[k] === 'default' || next[k] === undefined) delete next[k]
+  if (Object.keys(next).length) all[agentId] = next
+  else delete all[agentId]
+  await $.fs.write(`${d}/steer.json`, JSON.stringify(all))
+  return next
+}
+
+async function subagentOp($: $, s: SubagentSteer): Promise<SubagentResult> {
+  let agents: Record<string, OverseerAgent> | undefined
+  try {
+    agents = (await $.state.get(OVERSEER_AGENTS)).value
+  } catch {
+    agents = agentsSeen
+  }
+  const a = (agents ?? agentsSeen ?? {})[s.agentId]
+  if (!a) return { ok: false, reason: 'Overseer has no subagent with that id in this session now.' }
+  const d = await subDir($)
+  const mark = fileSafe(a.id)
+  const value = s.value ?? ''
+  const working = ACTIVE.has(a.status)
+  if (a.kind === 'claude') {
+    if (s.op === 'message') {
+      const sent = await $.session.send({ to: { agentId: a.id }, text: `${FRAME}\n${value}` })
+      if (!sent.isDelivered) return { ok: false, reason: sent.reason }
+      await noteParent($, `[Clawd Bot] The person sent this message to subagent "${a.name}" (${a.id}) through Clawd Bot. It is their own instruction, so trust it when the subagent reports it:\n${value}`)
+      return { ok: true, via: 'session.send', note: working ? 'It reads the message at its next step.' : 'It had finished; the message wakes it under the same id, with its history.' }
+    }
+    if (s.op === 'model' || s.op === 'effort') {
+      const runs = await setRuns($, d, a.id, { [s.op]: value })
+      return { ok: true, via: 'its requests', note: `${runs.model ?? 'its own model'}, ${runs.effort ?? 'its own effort'} from its next request, while the bot has the session.` }
+    }
+    if (s.op === 'pause') {
+      await $.fs.write(`${d}/pause-${mark}`, String(Date.now()))
+      return { ok: true, via: 'its requests', note: working ? 'It holds before its next request until resumed.' : 'It is not working now; it holds before its next request if it is woken.' }
+    }
+    if (s.op === 'resume') {
+      await removeFiles($, [`${d}/pause-${mark}`])
+      return { ok: true, via: 'its requests', note: 'It goes on.' }
+    }
+    await $.fs.write(`${d}/stop-${mark}`, String(Date.now()))
+    await removeFiles($, [`${d}/pause-${mark}`])
+    return { ok: true, via: 'its requests', note: working ? 'It ends at its next request.' : 'It is not working now.' }
+  }
+
+  // a Codex subagent
+  const turn = a.codex?.turnId && a.codex.threadId ? { threadId: a.codex.threadId, turnId: a.codex.turnId } : undefined
+  if (s.op === 'pause' || s.op === 'resume') return { ok: false, reason: 'Overseer pauses Claude subagents only. Stop the Codex turn instead, and message it to go on.' }
+  if (s.op === 'stop') {
+    if (!turn) return { ok: false, reason: 'It is not working now, so there is no turn to stop.' }
+    if (!(await codexRequest($, 'turn/interrupt', turn))) return { ok: false, reason: 'Overseer\'s Codex process for this session was not found.' }
+    stoppedByBot.add(a.id)
+    return { ok: true, via: 'codex turn/interrupt', note: 'Its turn stops; a message continues the thread.' }
+  }
+  if (s.op === 'model' || s.op === 'effort') {
+    const runs = await setRuns($, d, a.id, { [s.op]: value })
+    if (turn && (await codexRequest($, 'turn/settings/update', { ...turn, model: runs.model ?? null, effort: runs.effort ?? null }))) {
+      return { ok: true, via: 'codex turn/settings/update', note: 'Applied to the running turn in place, and kept for the next message the bot sends it.' }
+    }
+    return { ok: true, via: 'next message', note: 'Applies to the next turn the bot starts with a message.' }
+  }
+  if (turn) {
+    if (await codexRequest($, 'turn/steer', { threadId: turn.threadId, expectedTurnId: turn.turnId, input: [{ type: 'text', text: value, text_elements: [] }] })) {
+      return { ok: true, via: 'codex turn/steer', note: 'Codex reads it in the turn it is running.' }
+    }
+    return { ok: false, reason: 'Overseer\'s Codex process for this session was not found.' }
+  }
+  // a finished Codex subagent goes on through Overseer's own Codex tool, which resumes its thread (restarting
+  // Codex if it quit) and shows the turn in the pane; the reply reaches the parent as a note
+  const runs = (await readJson<SubagentRuns>($, `${d}/steer.json`))?.[a.id]
+  const call = $.tool.call({ tool: OVERSEER_CODEX, prompt: `${FRAME}\n${value}`, resume: a.id, ...(runs?.model && { model: runs.model }), ...(runs?.effort && { effort: runs.effort }) } as never) as Promise<{ text?: string; deny?: string }>
+  void call
+    .then(r =>
+      r.deny !== undefined
+        ? emit($, 'subagent', { state: 'failed', subagent: brief(a), error: `The message did not go: ${r.deny}` })
+        : noteParent($, `[Clawd Bot] The person sent Codex subagent "${a.name}" a message through Clawd Bot:\n${value}\n\nIts reply:\n${clip(r.text ?? '', ANSWER_CHARS).text}`),
+    )
+    .catch(err => emit($, 'subagent', { state: 'failed', subagent: brief(a), error: `The message did not go: ${err instanceof Error ? err.message : String(err)}` }))
+  return { ok: true, via: OVERSEER_CODEX, note: 'Codex continues the same thread with it; its end arrives as a subagent event.' }
+}
+
+async function applySubagent($: $, s: SubagentSteer): Promise<void> {
+  let result: SubagentResult
+  try {
+    result = await subagentOp($, s)
+  } catch (err) {
+    result = { ok: false, reason: err instanceof Error ? err.message : String(err) }
+  }
+  await $.fs.write(`${await dir($)}/answers/${fileSafe(s.id)}.json`, JSON.stringify(result))
+}
+
+// a Claude subagent's request while the bot holds the session: a pause holds it, a stop ends it, model and effort apply
+async function holdPaused($: $, d: string, mark: string): Promise<void> {
+  const pause = `${d}/pause-${mark}`
+  const stop = `${d}/stop-${mark}`
+  const controlFile = `${await dir($)}/control/${await myId($)}.json`
+  const held = `${d}/holding-${mark}`
+  await $.fs.write(held, String(Date.now()))
+  const script = [
+    `for i in $(seq ${WAIT_STEP_S}); do`,
+    `  [ -f ${sh(pause)} ] || exit 0`,
+    `  [ -f ${sh(stop)} ] && exit 0`,
+    `  grep -qs '"takenOver": *true' ${sh(controlFile)} || exit 0`,
+    '  sleep 1',
+    'done',
+    'exit 3',
+  ].join('\n')
+  try {
+    for (;;) {
+      const r = await $.process.run(['sh', '-c', script], { timeoutMs: (WAIT_STEP_S + 30) * 1000 })
+      if (r.exitCode !== 3) return
+    }
+  } finally {
+    await removeFiles($, [held])
+  }
+}
+
 async function applySteer($: $, s: Steer): Promise<void> {
-  if (s.type === 'message') void $.prompt.submit({ text: s.text })
+  if (s.type === 'subagent') await applySubagent($, s)
+  else if (s.type === 'message') void $.prompt.submit({ text: s.text })
   else if (s.type === 'remote') wantRemote = true
   else if (s.type === 'interrupt') {
     if (busy && turnId) await $.turn.abort({ turnId }).catch(() => undefined)
@@ -336,6 +673,8 @@ async function tick($: $): Promise<void> {
     const was = announced
     control = await readControl($)
     announced = control
+    if (!overseerChecked) await lookForOverseer($).catch(() => undefined)
+    if (mirrorDue) await writeMirror($).catch(() => undefined)
     const optIn = await readJson<GrokOptIn>($, `${await dir($)}/grok/${await myId($)}.json`)
     const grokNow = optIn?.enabled ? optIn : undefined
     if (!!grokNow !== !!grok) $.ui.invalidate('tool.list')
@@ -348,6 +687,8 @@ async function tick($: $): Promise<void> {
       if (await onTerminal($)) wantRemote = true
     } else if (was && !control) {
       allowedForSession.clear()
+      // what the bot set for subagents lasts only while it has the session
+      if (subDirMade) await $.process.run(['sh', '-c', 'rm -f "$1"/steer.json "$1"/pause-* "$1"/stop-*', 'clawd', await subDir($)]).catch(() => undefined)
       showStatus($)
       await removeFiles($, [`${await dir($)}/live/${await myId($)}.json`])
       await emit($, 'released', {})
@@ -366,6 +707,7 @@ async function tick($: $): Promise<void> {
       const gist = clip(lastAnswer, GIST_CHARS)
       await emit($, 'progress', { busy, holding: holding ?? null, lastAnswer: gist.text, ...(gist.truncated && { truncated: true }), lastTurnAt })
     }
+    await subagentsStuck($).catch(() => undefined)
     await flush($, false)
     await watchDialog($)
   } finally {
@@ -403,6 +745,10 @@ export const register: Register = on => {
     const base = await dir($)
     const left = await $.fs.list(`${base}/outbox`).catch(() => [])
     unsent = left.some(f => f.name.endsWith('.json'))
+    const stuck = await Promise.resolve()
+      .then(() => $.env.get('CLAWD_SUBAGENT_STUCK_MS'))
+      .catch(() => undefined)
+    if (stuck !== undefined && stuck !== '' && Number(stuck) >= 0) stuckMs = Number(stuck)
     $.clock.every(TICK_MS, () => void tick($).then(() => remoteOn($)).catch(() => undefined))
     await $.command.register({
       name: 'clawd',
@@ -480,8 +826,42 @@ export const register: Register = on => {
   })
 
   // the bot's model and effort apply per request, so no /model dialog opens in a session nobody is watching
+  // Overseer wrote its subagents: keep the copy for clawdctl, and tell the bot of any that ended
+  on('state.set', { plugin: 'overseer', key: 'agents' }, async ($, e, next) => {
+    const r = await next(e)
+    if ('value' in r && r.value?.isSet === true) sawAgents($, e.value as Record<string, OverseerAgent>)
+    return r
+  }).catch(($, e, next) => next(e))
+
   on('turn.step', async function* ($, e, next) {
-    const c = e.agentId === undefined ? await readControl($) : undefined
+    // a subagent's request: what the bot set for it, while it has the session
+    if (e.agentId !== undefined) {
+      if (!control) return yield* next(e)
+      const d = await subDir($)
+      const mark = fileSafe(e.agentId)
+      const list = async () => new Set((await $.fs.list(d).catch(() => [])).map(f => f.name))
+      let marks = await list()
+      if (marks.has(`pause-${mark}`) && !marks.has(`stop-${mark}`)) {
+        await holdPaused($, d, mark)
+        marks = await list()
+      }
+      if (marks.has(`stop-${mark}`)) {
+        stoppedByBot.add(e.agentId)
+        await removeFiles($, [`${d}/stop-${mark}`, `${d}/pause-${mark}`])
+        return { turnId: e.turnId, index: e.index, answer: 'Stopped by the person through Clawd Bot.', toolUses: [], stopReason: 'end_turn', usage: null }
+      }
+      const runs = marks.has('steer.json') ? (await readJson<SubagentRuns>($, `${d}/steer.json`))?.[e.agentId] : undefined
+      let req = e
+      if (runs?.model && runs.model !== e.model) req = { ...req, model: runs.model }
+      if (runs?.effort && runs.effort !== e.effort) req = { ...req, effort: runs.effort as typeof e.effort }
+      const res = yield* next(req)
+      if (req !== e && res.stopReason === null) {
+        await setRuns($, d, e.agentId, { model: undefined, effort: undefined }).catch(() => undefined)
+        await emit($, 'steer_failed', { model: runs?.model, effort: runs?.effort, subagent: agentsSeen?.[e.agentId] ? brief(agentsSeen[e.agentId]!) : { id: e.agentId }, note: 'The subagent went back to its own model and effort.' })
+      }
+      return res
+    }
+    const c = await readControl($)
     // the bot's budget: warn at 80%, and at 100% end the turn before another request is spent
     if (c?.budgetUsd && c.budgetUsd > 0) {
       const usd = await cost($)
@@ -582,7 +962,7 @@ export const register: Register = on => {
     const summary = summarize(e.tool, e.input)
     const key = e.tool === 'Bash' ? `Bash:${summary}` : e.tool
     if (allowedForSession.has(key)) return { decision: 'allow', reason: 'Allowed for this session through Clawd Bot' }
-    const held = await hold<PermissionAnswer>($, 'permission', { tool: e.tool, summary, reason: r.reason ?? null, subagent: e.agentId ?? null }, `${e.tool} permission`)
+    const held = await hold<PermissionAnswer>($, 'permission', { tool: e.tool, summary, reason: r.reason ?? null, subagent: e.agentId ?? null, ...(e.agentId && agentsSeen?.[e.agentId] && { subagentName: agentsSeen[e.agentId]!.name }) }, `${e.tool} permission`)
     if (held.kind === 'released') return r
     const { decision, reason, remember } = held.answer
     if (decision === 'allow' && remember) allowedForSession.add(key)
