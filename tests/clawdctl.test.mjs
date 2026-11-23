@@ -793,6 +793,20 @@ test('subagents says cleanly when Overseer is not installed, and when a session 
   assert.deepEqual(empty.json.subagents, []);
   assert.deepEqual(empty.json.overseer, { installed: true, version: '0.3.0', courier: true });
   assert.match(empty.json.note, /restarted/);
+
+  // the session itself says Overseer is not loaded there
+  fs.mkdirSync(path.join(dir, 'subagents', SESSION), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'subagents', SESSION, 'agents.json'), JSON.stringify({ sessionId: SESSION, pid: 1, at: Date.now(), overseer: false, agents: [] }));
+  const notHere = await clawdctl(['subagents', 'api-fix']);
+  assert.equal(notHere.code, 1);
+  assert.match(notHere.stderr, /Overseer is not running in this session/);
+
+  fs.writeFileSync(path.join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'overseer@overseer': false } }));
+  const off = await clawdctl(['subagents', 'api-fix']);
+  assert.equal(off.code, 1);
+  assert.match(off.stderr, /installed but turned off.*claude plugin enable overseer@overseer/s);
+  fs.rmSync(path.join(home, '.claude', 'settings.json'));
+  fs.rmSync(path.join(dir, 'subagents', SESSION), { recursive: true });
 });
 
 test('subagents lists Claude and Codex subagents as Overseer sees them, with what the bot set', async () => {

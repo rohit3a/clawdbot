@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.0
+
+- Works with Claude Code 2.1.330 as well as 2.1.325. A finished turn reads the control file as it is then, so a take-over or release in the two seconds before it decides whether the turn reaches the bot. A tick asked for while another runs (a `/clawd` command, a turn's start) now runs right after it instead of being skipped.
+- Subagent steering goes through [Overseer](https://github.com/rohit3a/overseer) 0.4.0's control when it is installed. Overseer's pane then shows what the bot set. A Codex model switch that Codex refuses mid-turn still lands: the turn stops and a new one continues on the new model. A message to a finished Claude subagent goes through `overseer-courier`, so model, effort, pause and stop reach the run it wakes. On release the bot's model, effort and pauses are put back. With Overseer 0.3.0, Clawd steers as before.
+- With Overseer 0.3.0, a model or effort change to a running Codex turn now says it is unconfirmed. Codex applies effort in place but refuses some model switches mid-turn, and only Overseer sees its answer. 0.8.0 reported every change as applied.
+- `subagents` says why a session has none to show: Overseer is not installed, it is installed but turned off, or it is not running in that session. Each session's `agents.json` now has `overseer: false` when Overseer is not loaded.
+- On Linux, scheduled tasks are persistent systemd user timers, kept in unit files under `~/.config/systemd/user/`. They survive a reboot. A task whose time passed while the computer was off runs when your user's systemd starts again: at boot with lingering on (`loginctl enable-linger`), otherwise at login. Running or cancelling a task removes its files. Tasks scheduled with 0.8.0 still go away at a reboot.
+- A scheduled task runs with the `CLAWD_HOME` it was scheduled under, on Linux and macOS.
+- `scripts/release.mjs` tags a version that the PR already set without making an empty commit. Any failing check stops the release, puts the version files back, and commits nothing.
+- The docs say plainly that Windows is not supported.
+
 ## 0.8.0
 
 - Subagents, through [Overseer](https://github.com/rohit3a/overseer) 0.3.0 or later, for Claude subagents and Codex agents alike. `clawdctl subagents <session>` lists a session's subagents as JSON: id, name, kind (`claude` or `codex`), model, effort, status, steps, tokens, and last activity. `clawdctl subagent <session> <id> [--count n]` adds the prompt it was given and its recent thread. Without Overseer installed, both say so and name the install commands.

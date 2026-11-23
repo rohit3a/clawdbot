@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { panelOf, render, usageLimits } from './screen.mjs';
 
-const VERSION = '0.8.0';
+const VERSION = '1.0.0';
 const HOME = os.homedir();
 const DIR = process.env.CLAWD_HOME || path.join(HOME, '.clawd');
 const PUSH_GAP_MS = 20_000;
@@ -588,7 +588,7 @@ function subagentsOf(a) {
   if (!info.installed) refuse(`Overseer is not installed on this computer, so subagents can't be watched or steered. To add it: ${OVERSEER_INSTALL}. Sessions started after that have it.`);
   if (info.enabled === false) refuse('Overseer is installed but turned off, so subagents can\'t be watched or steered. claude plugin enable overseer@overseer turns it on; sessions started after that have it.');
   if (mirror?.overseer === false) refuse('Overseer is not running in this session (it started before Overseer was installed, or with it turned off), so its subagents can\'t be watched or steered. A session started now has it.');
-  return { mirror: undefined, note: 'No subagents seen in this session. Overseer is installed, but a session opened before it or before Clawd 0.8.0 reports none until it is restarted.' };
+  return { mirror: undefined, note: 'No subagents seen in this session yet. A session opened before Clawd 0.8.0 reports none until it is restarted.' };
 }
 
 // a session's copy is kept a week after it was last written, so the bot can still read an ended session's subagents
