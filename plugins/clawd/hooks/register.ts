@@ -897,6 +897,9 @@ export const register: Register = on => {
       busy = false
       lastTurnAt = Date.now()
       lastAnswer = e.answer ?? ''
+      // the control file as it is now, not as the last tick read it: a takeover or release in the last tick's gap
+      // still decides whether this turn reaches the bot
+      control = await readControl($)
       if (control) {
         await writeLive($)
         const failed = e.reason === 'error' || e.reason === 'refusal'

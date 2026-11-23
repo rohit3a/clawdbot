@@ -357,6 +357,20 @@ test('an idle session pushes nothing when a turn fails', async ($, on) => {
   expect(outbox(files)).toEqual([])
 })
 
+test('a turn that ends just after the bot lets go of the session is not pushed', async ($, on) => {
+  const files = new Map([[CONTROL, takenOver()]])
+  engine(on, files, noWait)
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: CWD, surface: 'terminal', isInteractive: true })
+  await $.turn.start({ turnId: 't1', text: 'go' } as never)
+  const before = outbox(files).length
+
+  files.set(CONTROL, JSON.stringify({ takenOver: false }))
+  await $.turn.complete({ turnId: 't1', answer: 'Done.', durationMs: 5, isAborted: false, reason: 'answer' })
+
+  expect(outbox(files).slice(before).map(e => e.kind)).not.toContain('turn_done')
+})
+
 // tool.list is raised by the engine, not by a test, so a second plugin asks for the list the session would get
 const lister = {
   name: 'lister',

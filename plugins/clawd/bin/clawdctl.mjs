@@ -1083,23 +1083,33 @@ function whenOf(at) {
   return Math.ceil(t / 60_000) * 60_000;
 }
 
-// macOS: a launchd agent (runs at wake if the Mac slept through it). Linux: a systemd user timer.
+// macOS: a launchd agent (runs at wake if the Mac slept through it). Linux: a persistent systemd user timer, in unit
+// files that outlive a reboot; one whose time passed while the computer was off runs when the user's systemd starts
+// again (at boot with lingering on, else at login).
 const plistOf = (id) => path.join(HOME, 'Library', 'LaunchAgents', `com.clawd.${id}.plist`);
+const unitDir = () => path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, '.config'), 'systemd', 'user');
+const unitOf = (id, ext) => path.join(unitDir(), `clawd-${id}.${ext}`);
+// a value in a unit file: quoted, with systemd's specifiers and variables taken literally
+const unitWord = (s) => `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%').replace(/\$/g, '$$$$')}"`;
+const systemctl = (...args) => execFileSync('systemctl', ['--user', ...args], { stdio: 'ignore', timeout: 15_000 });
 function timerCommand(id) {
   const shim = path.join(HOME, '.local', 'bin', 'clawdctl');
   return fs.existsSync(shim) ? ['/bin/sh', shim, 'run-scheduled', id] : [process.execPath, fileURLToPath(import.meta.url), 'run-scheduled', id];
 }
+// the task runs with the PATH clawdctl was given, and finds its task under the same CLAWD_HOME
+const timerEnv = () => ({ PATH: USER_PATH, ...(process.env.CLAWD_HOME && { CLAWD_HOME: path.resolve(DIR) }) });
 function installTimer(t) {
   if (process.env.CLAWD_NO_TIMER) return;
   const d = new Date(t.at);
   if (process.platform === 'darwin') {
     const x = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const env = Object.entries(timerEnv()).map(([k, v]) => `<key>${k}</key><string>${x(v)}</string>`).join('');
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.clawd.${t.id}</string>
 <key>ProgramArguments</key><array>${timerCommand(t.id).map((a) => `<string>${x(a)}</string>`).join('')}</array>
-<key>EnvironmentVariables</key><dict><key>PATH</key><string>${x(USER_PATH)}</string></dict>
+<key>EnvironmentVariables</key><dict>${env}</dict>
 <key>StartCalendarInterval</key><dict><key>Month</key><integer>${d.getMonth() + 1}</integer><key>Day</key><integer>${d.getDate()}</integer><key>Hour</key><integer>${d.getHours()}</integer><key>Minute</key><integer>${d.getMinutes()}</integer></dict>
 </dict></plist>
 `;
@@ -1109,7 +1119,17 @@ function installTimer(t) {
   } else {
     const pad = (n) => String(n).padStart(2, '0');
     const cal = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:00`;
-    execFileSync('systemd-run', ['--user', `--unit=clawd-${t.id}`, `--on-calendar=${cal}`, `--setenv=PATH=${USER_PATH}`, ...timerCommand(t.id)], { stdio: 'ignore', timeout: 15_000 });
+    const env = Object.entries(timerEnv()).map(([k, v]) => `Environment=${unitWord(`${k}=${v}`)}\n`).join('');
+    fs.mkdirSync(unitDir(), { recursive: true });
+    fs.writeFileSync(unitOf(t.id, 'service'), `[Unit]\nDescription=Clawd scheduled task ${t.id}\n\n[Service]\nType=oneshot\n${env}ExecStart=${timerCommand(t.id).map(unitWord).join(' ')}\n`);
+    fs.writeFileSync(unitOf(t.id, 'timer'), `[Unit]\nDescription=Clawd scheduled task ${t.id}\n\n[Timer]\nOnCalendar=${cal}\nPersistent=true\nAccuracySec=1s\n\n[Install]\nWantedBy=timers.target\n`);
+    try {
+      systemctl('daemon-reload');
+      systemctl('enable', '--now', `clawd-${t.id}.timer`);
+    } catch (e) {
+      removeTimer(t);
+      throw e;
+    }
   }
 }
 function removeTimer(t) {
@@ -1118,7 +1138,13 @@ function removeTimer(t) {
     fs.rmSync(plistOf(t.id), { force: true });
     try { execFileSync('launchctl', ['bootout', `gui/${process.getuid()}/com.clawd.${t.id}`], { stdio: 'ignore', timeout: 15_000 }); } catch {}
   } else {
-    try { execFileSync('systemctl', ['--user', 'stop', `clawd-${t.id}.timer`], { stdio: 'ignore', timeout: 15_000 }); } catch {}
+    // a running task's own service is left to finish; only its timer goes, and with it both unit files
+    try { systemctl('stop', `clawd-${t.id}.timer`); } catch {}
+    try { systemctl('disable', `clawd-${t.id}.timer`); } catch {}
+    const had = ['timer', 'service'].filter((ext) => fs.existsSync(unitOf(t.id, ext)));
+    for (const ext of had) fs.rmSync(unitOf(t.id, ext), { force: true });
+    fs.rmSync(path.join(process.env.XDG_DATA_HOME || path.join(HOME, '.local', 'share'), 'systemd', 'timers', `stamp-clawd-${t.id}.timer`), { force: true });
+    if (had.length) try { systemctl('daemon-reload'); } catch {}
   }
 }
 

@@ -429,6 +429,30 @@ test('a scheduled task is listed, can be cancelled, and refuses a time already p
   assert.equal((await clawdctl(['schedule', '--at', '2020-01-01T00:00', '--folder', '/w/api', '--prompt', 'x'])).code, 1);
 });
 
+test('on Linux a scheduled task is a persistent systemd timer in unit files, and cancelling removes them', { skip: process.platform !== 'linux' }, async () => {
+  const bin = fs.mkdtempSync(path.join(root, 'bin-'));
+  const xdg = fs.mkdtempSync(path.join(root, 'xdg-'));
+  const calls = path.join(bin, 'calls');
+  fs.writeFileSync(path.join(bin, 'systemctl'), `#!/bin/sh\necho "$*" >> ${JSON.stringify(calls)}\n`, { mode: 0o755 });
+  const run = (args) => new Promise((resolve) => execFile(process.execPath, [CLAWDCTL, ...args], {
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, HOME: home, CLAWD_HOME: dir, CLAUDE_BIN: path.join(root, 'claude'), XDG_CONFIG_HOME: path.join(xdg, 'config'), XDG_DATA_HOME: path.join(xdg, 'data') },
+  }, (err, stdout) => resolve({ code: err ? 1 : 0, json: JSON.parse(stdout || 'null') })));
+  const { json } = await run(['schedule', '--at', '+2h', '--folder', '/w/api', '--prompt', 'Run the nightly checks']);
+  const unit = (ext) => path.join(xdg, 'config', 'systemd', 'user', `clawd-${json.id}.${ext}`);
+  const timer = fs.readFileSync(unit('timer'), 'utf8');
+  const service = fs.readFileSync(unit('service'), 'utf8');
+  assert.match(timer, /^OnCalendar=\d{4}-\d\d-\d\d \d\d:\d\d:00$/m);
+  assert.match(timer, /^Persistent=true$/m);
+  assert.match(timer, /^WantedBy=timers\.target$/m);
+  assert.ok(service.includes(`Environment="CLAWD_HOME=${dir}"`));
+  assert.match(service, new RegExp(`^ExecStart=.* "run-scheduled" "${json.id}"$`, 'm'));
+  assert.deepEqual(fs.readFileSync(calls, 'utf8').trim().split('\n'), ['--user daemon-reload', `--user enable --now clawd-${json.id}.timer`]);
+
+  assert.equal((await run(['unschedule', json.id])).json.cancelled, true);
+  assert.equal(fs.existsSync(unit('timer')) || fs.existsSync(unit('service')), false);
+  assert.deepEqual(fs.readFileSync(calls, 'utf8').trim().split('\n').slice(2), [`--user stop clawd-${json.id}.timer`, `--user disable clawd-${json.id}.timer`, '--user daemon-reload']);
+});
+
 test('a scheduled task that runs pushes a scheduled event', async () => {
   await clawdctl(['config', 'webhook', '--url', hookUrl()]);
   const work = fs.mkdtempSync(path.join(root, 'work-'));
